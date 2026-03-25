@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Виртуальное окружение
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Учётные данные (НИКОГДА не коммитить!)
+credentials/
+*.json
+!credentials/.gitkeep
+token.pickle
+token.json
+
+# Переменные окружения
+.env
+
+# Локальная база данных
+*.db
+*.sqlite
+*.sqlite3
+
+# Сгенерированные документы
+output/
+
+# Скачанные шаблоны
+templates_cache/
+
+# OS
+.DS_Store
+Thumbs.db
