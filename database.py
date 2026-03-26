@@ -54,7 +54,7 @@ class Database:
 
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or config.DATABASE_PATH
-        self.connection = sqlite3.connect(str(self.db_path))
+        self.connection = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA encoding='UTF-8'")

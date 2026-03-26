@@ -151,7 +151,7 @@ class App(tk.Tk):
                     table_name, row_count
                 ))
             except Exception as e:
-                self.after(0, lambda: self._on_sheet_error(str(e)))
+                self.after(0, lambda msg=str(e): self._on_sheet_error(msg))
 
         self._run_in_thread(do_load)
 
@@ -242,13 +242,6 @@ class App(tk.Tk):
             name_frame, textvariable=self.filename_column_var, width=25
         ).pack(side=tk.LEFT, padx=(10, 0))
 
-        # Галочка — вставлять таблицу
-        self.include_table_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            frame,
-            text="Вставлять полную таблицу по плейсхолдеру ${table}",
-            variable=self.include_table_var
-        ).pack(anchor=tk.W, pady=(0, 10))
 
         # Кнопка генерации
         self.btn_generate = ttk.Button(
@@ -307,7 +300,7 @@ class App(tk.Tk):
                     local_path, placeholders
                 ))
             except Exception as e:
-                self.after(0, lambda: self._on_template_error(str(e)))
+                self.after(0, lambda msg=str(e): self._on_template_error(msg))
 
         self._run_in_thread(do_download)
 
@@ -365,12 +358,11 @@ class App(tk.Tk):
                     template_path=template_path,
                     table_name=table_name,
                     filename_column=filename_col,
-                    include_table=self.include_table_var.get(),
                     db=self.db
                 )
                 self.after(0, lambda: self._on_documents_generated(files))
             except Exception as e:
-                self.after(0, lambda: self._on_generate_error(str(e)))
+                self.after(0, lambda msg=str(e): self._on_generate_error(msg))
 
         self._run_in_thread(do_generate)
 
@@ -531,7 +523,7 @@ class App(tk.Tk):
 
                 self.after(0, lambda: self._on_email_sent(results))
             except Exception as e:
-                self.after(0, lambda: self._on_email_error(str(e)))
+                self.after(0, lambda msg=str(e): self._on_email_error(msg))
 
         self._run_in_thread(do_send)
 

@@ -1,28 +1,32 @@
 """
 Движок обработки шаблонов .docx.
 
-Обеспечивает:
-- Поиск плейсхолдеров ${...} в документе
-- Замену ${column_name} на значения из базы данных
-- Вставку таблиц по плейсхолдеру ${table}
-- Генерацию одного документа на каждую строку данных
+Синтаксис плейсхолдеров:
+  ${ФИО}                   — значение поля текущей строки (студента)
+  ${table}                 — таблица всех строк, все столбцы
+  ${table:ФИО,Группа}      — таблица всех строк, только указанные столбцы
+  ${row}                   — текущая строка как таблица, все столбцы
+  ${row:ФИО,Группа}        — текущая строка как таблица, только указанные столбцы
 """
 
-import copy
 import re
 from pathlib import Path
 from typing import Optional
 
 from docx import Document
-from docx.shared import Pt, Cm
+from docx.shared import Pt
 from docx.enum.table import WD_TABLE_ALIGNMENT
-from docx.oxml.ns import qn
 
 import config
 from database import Database
 
 # Регулярное выражение для поиска плейсхолдеров ${...}
 PLACEHOLDER_PATTERN = re.compile(r"\$\{([^}]+)\}")
+
+# Плейсхолдеры таблиц: ${table}, ${table:col1,col2}, ${row}, ${row:col1,col2}
+TABLE_PLACEHOLDER_PATTERN = re.compile(
+    r"\$\{(table|row)(?::([^}]*))?\}", re.IGNORECASE
+)
 
 
 def find_placeholders(docx_path: Path) -> list[str]:
@@ -117,38 +121,74 @@ def _replace_text_in_paragraph(paragraph, replacements: dict[str, str]):
         paragraph.add_run(new_text)
 
 
-def _insert_table_after_paragraph(doc, paragraph, headers: list[str],
-                                  rows: list[list[str]]):
+def _filter_columns(
+    headers: list[str],
+    rows: list[list[str]],
+    columns: Optional[list[str]],
+    original_headers_map: Optional[dict[str, str]] = None,
+) -> tuple[list[str], list[list[str]]]:
     """
-    Вставляет таблицу с данными после указанного параграфа.
+    Фильтрует столбцы по списку columns.
+    Если columns=None — возвращает все столбцы без изменений.
+    Принимает как оригинальные (русские), так и безопасные имена.
+    """
+    if not columns:
+        return headers, rows
 
-    Удаляет параграф с ${table} и вставляет вместо него таблицу.
-    """
-    # Создаём таблицу
+    # Строим индекс: lowercase имя → индекс (по оригинальным именам)
+    col_index: dict[str, int] = {}
+    for i, h in enumerate(headers):
+        col_index[h.lower()] = i
+    # Добавляем поиск и по безопасным (санированным) именам
+    if original_headers_map:
+        for orig, safe in original_headers_map.items():
+            idx = col_index.get(orig.lower(), -1)
+            if idx != -1:
+                col_index[safe.lower()] = idx
+
+    selected_indices = []
+    selected_headers = []
+    for col in columns:
+        idx = col_index.get(col.strip().lower(), -1)
+        if idx != -1 and idx not in selected_indices:
+            selected_indices.append(idx)
+            selected_headers.append(headers[idx])
+
+    if not selected_indices:
+        return headers, rows
+
+    filtered_rows = [[row[i] for i in selected_indices if i < len(row)]
+                     for row in rows]
+    return selected_headers, filtered_rows
+
+
+def _insert_table_after_paragraph(
+    doc,
+    paragraph,
+    headers: list[str],
+    rows: list[list[str]],
+):
+    """Вставляет таблицу с данными вместо параграфа-плейсхолдера."""
     num_cols = len(headers)
     num_rows = len(rows) + 1  # +1 для заголовков
 
     table = doc.add_table(rows=num_rows, cols=num_cols)
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
-
-    # Применяем стиль таблицы
     try:
         table.style = "Table Grid"
     except KeyError:
-        pass  # Стиль может отсутствовать
+        pass
 
-    # Заполняем заголовки
-    header_row = table.rows[0]
+    # Заголовки
     for i, header in enumerate(headers):
-        cell = header_row.cells[i]
+        cell = table.rows[0].cells[i]
         cell.text = str(header)
-        # Делаем заголовки жирными
-        for paragraph in cell.paragraphs:
-            for run in paragraph.runs:
+        for p in cell.paragraphs:
+            for run in p.runs:
                 run.font.bold = True
                 run.font.size = Pt(10)
 
-    # Заполняем данные
+    # Данные
     for row_idx, row_data in enumerate(rows):
         table_row = table.rows[row_idx + 1]
         for col_idx, value in enumerate(row_data):
@@ -159,92 +199,109 @@ def _insert_table_after_paragraph(doc, paragraph, headers: list[str],
                     for run in p.runs:
                         run.font.size = Pt(10)
 
-    # Перемещаем таблицу на место параграфа с ${table}
-    paragraph_element = paragraph._element
-    table_element = table._tbl
-
-    # Вставляем таблицу перед параграфом
-    paragraph_element.addprevious(table_element)
-
-    # Удаляем параграф с ${table}
-    parent = paragraph_element.getparent()
-    parent.remove(paragraph_element)
+    # Вставляем таблицу перед параграфом-плейсхолдером, затем удаляем его
+    paragraph._element.addprevious(table._tbl)
+    paragraph._element.getparent().remove(paragraph._element)
 
 
 def generate_document(
     template_path: Path,
     row_data: dict[str, str],
     output_filename: str,
-    table_data: Optional[tuple[list[str], list[list[str]]]] = None,
+    all_rows_data: Optional[tuple[list[str], list[list[str]]]] = None,
     original_headers_map: Optional[dict[str, str]] = None,
 ) -> Path:
     """
     Генерирует документ из шаблона, заменяя плейсхолдеры.
 
-    Аргументы:
-        template_path: Путь к файлу шаблона .docx
-        row_data: Словарь {имя_столбца: значение} для текущей строки
-        output_filename: Имя выходного файла
-        table_data: Кортеж (заголовки, строки) для вставки таблицы
-        original_headers_map: Маппинг оригинальных имён к безопасным
-
-    Возвращает:
-        Path к сгенерированному файлу
+    Поддерживаемые плейсхолдеры:
+      ${ФИО}               — значение поля текущей строки
+      ${table}             — таблица всех строк, все столбцы
+      ${table:ФИО,Группа}  — таблица всех строк, только указанные столбцы
+      ${row}               — текущая строка как таблица, все столбцы
+      ${row:ФИО,Группа}    — текущая строка как таблица, только указанные столбцы
     """
     doc = Document(str(template_path))
 
-    # Строим замены: поддерживаем и оригинальные, и безопасные имена
-    replacements = {}
+    # Строим замены для обычных полей (оригинальные + безопасные имена)
+    replacements: dict[str, str] = {}
     if original_headers_map:
-        # Маппинг в обе стороны
-        reverse_map = {v: k for k, v in original_headers_map.items()}
         for orig_name, safe_name in original_headers_map.items():
             value = row_data.get(safe_name, "")
-            replacements[orig_name] = value  # ${Оригинальное имя}
-            replacements[safe_name] = value  # ${безопасное_имя}
+            replacements[orig_name] = value
+            replacements[safe_name] = value
     else:
         replacements = dict(row_data)
 
-    # Обработка параграфов
-    paragraphs_to_replace_with_table = []
-    for paragraph in doc.paragraphs:
-        if "${table}" in paragraph.text.lower() or "${TABLE}" in paragraph.text:
-            paragraphs_to_replace_with_table.append(paragraph)
-        else:
-            _replace_text_in_paragraph(paragraph, replacements)
+    # Подготавливаем данные текущей строки как таблицу (для ${row})
+    if original_headers_map:
+        row_headers = list(original_headers_map.keys())
+        row_values = [row_data.get(safe, "") for safe in original_headers_map.values()]
+    else:
+        row_headers = list(row_data.keys())
+        row_values = list(row_data.values())
+    current_row_as_table = (row_headers, [row_values])
 
-    # Обработка таблиц в документе
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for paragraph in cell.paragraphs:
-                    _replace_text_in_paragraph(paragraph, replacements)
-
-    # Обработка колонтитулов
-    for section in doc.sections:
-        for header_footer in [section.header, section.footer]:
-            if header_footer is not None:
-                for paragraph in header_footer.paragraphs:
-                    _replace_text_in_paragraph(paragraph, replacements)
-
-    # Вставка таблиц (${table})
-    if table_data and paragraphs_to_replace_with_table:
-        headers, rows = table_data
-        # Используем оригинальные имена для заголовков таблицы
-        display_headers = headers
+    # Данные всех строк для ${table}
+    if all_rows_data:
+        all_headers_raw, all_rows_raw = all_rows_data
         if original_headers_map:
-            reverse_map = {v: k for k, v in original_headers_map.items()}
-            display_headers = [reverse_map.get(h, h) for h in headers]
+            rev = {v: k for k, v in original_headers_map.items()}
+            display_all_headers = [rev.get(h, h) for h in all_headers_raw]
+        else:
+            display_all_headers = all_headers_raw
+        all_table_data = (display_all_headers, all_rows_raw)
+    else:
+        all_table_data = None
 
-        for paragraph in paragraphs_to_replace_with_table:
-            _insert_table_after_paragraph(
-                doc, paragraph, display_headers, rows
+    def _process_paragraphs(paragraphs):
+        """Обрабатывает список параграфов: заменяет поля, собирает таблицы."""
+        pending_tables = []
+        for paragraph in paragraphs:
+            text = paragraph.text
+            m = TABLE_PLACEHOLDER_PATTERN.search(text)
+            if m:
+                kind = m.group(1).lower()       # "table" или "row"
+                cols_str = m.group(2)           # "ФИО,Группа" или None
+                columns = [c.strip() for c in cols_str.split(",")] if cols_str else None
+                pending_tables.append((paragraph, kind, columns))
+            else:
+                _replace_text_in_paragraph(paragraph, replacements)
+        return pending_tables
+
+    # Обрабатываем основные параграфы
+    pending = _process_paragraphs(doc.paragraphs)
+
+    # Обрабатываем ячейки таблиц документа
+    for tbl in doc.tables:
+        for trow in tbl.rows:
+            for cell in trow.cells:
+                pending += _process_paragraphs(cell.paragraphs)
+
+    # Обрабатываем колонтитулы
+    for section in doc.sections:
+        for hf in [section.header, section.footer]:
+            if hf is not None:
+                pending += _process_paragraphs(hf.paragraphs)
+
+    # Вставляем таблицы (в обратном порядке, чтобы не сбить позиции)
+    for paragraph, kind, columns in reversed(pending):
+        if kind == "table":
+            if all_table_data is None:
+                paragraph._element.getparent().remove(paragraph._element)
+                continue
+            h, r = _filter_columns(
+                all_table_data[0], all_table_data[1], columns, original_headers_map
             )
+        else:  # row
+            h, r = _filter_columns(
+                current_row_as_table[0], current_row_as_table[1],
+                columns, original_headers_map
+            )
+        _insert_table_after_paragraph(doc, paragraph, h, r)
 
-    # Сохраняем результат
     output_path = config.OUTPUT_DIR / output_filename
     doc.save(str(output_path))
-
     return output_path
 
 
@@ -252,8 +309,7 @@ def generate_documents_for_all_rows(
     template_path: Path,
     table_name: str,
     filename_column: Optional[str] = None,
-    include_table: bool = False,
-    db: Optional[Database] = None
+    db: Optional[Database] = None,
 ) -> list[Path]:
     """
     Генерирует по одному документу на каждую строку данных.
@@ -277,16 +333,15 @@ def generate_documents_for_all_rows(
         headers, all_rows = db.get_all_data(table_name)
         original_map = db.get_original_headers(table_name)
 
-        # Данные для таблицы (если нужна)
-        table_data = (headers, all_rows) if include_table else None
+        # Данные всех строк передаём всегда — generate_document сам решит
+        # что вставлять по ${table} и ${row}
+        all_rows_data = (headers, all_rows)
 
         generated_files = []
 
         for idx, row in enumerate(all_rows):
-            # Создаём словарь данных для строки
             row_data = dict(zip(headers, row))
 
-            # Формируем имя файла
             if filename_column and filename_column in row_data:
                 safe_name = re.sub(r'[<>:"/\\|?*]', "_",
                                    str(row_data[filename_column]))
@@ -298,8 +353,8 @@ def generate_documents_for_all_rows(
                 template_path=template_path,
                 row_data=row_data,
                 output_filename=output_name,
-                table_data=table_data,
-                original_headers_map=original_map
+                all_rows_data=all_rows_data,
+                original_headers_map=original_map,
             )
             generated_files.append(output_path)
 

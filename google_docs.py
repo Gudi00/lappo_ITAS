@@ -61,21 +61,26 @@ def download_template(
     drive_service = build("drive", "v3", credentials=creds)
 
     file_metadata = drive_service.files().get(
-        fileId=doc_id, fields="name"
+        fileId=doc_id, fields="name,mimeType"
     ).execute()
     doc_title = file_metadata.get("name", "template")
+    mime_type = file_metadata.get("mimeType", "")
 
     # Формируем безопасное имя файла
     safe_title = re.sub(r'[<>:"/\\|?*]', "_", doc_title)
-    local_filename = f"{safe_title}.docx"
-    local_path = config.TEMPLATES_CACHE_DIR / local_filename
+    if not safe_title.endswith(".docx"):
+        safe_title += ".docx"
+    local_path = config.TEMPLATES_CACHE_DIR / safe_title
 
-    # Экспортируем как .docx
-    request = drive_service.files().export_media(
-        fileId=doc_id,
-        mimeType="application/vnd.openxmlformats-officedocument"
-                 ".wordprocessingml.document"
-    )
+    # Нативный Google Doc — экспортируем; загруженный .docx — скачиваем напрямую
+    if mime_type == "application/vnd.google-apps.document":
+        request = drive_service.files().export_media(
+            fileId=doc_id,
+            mimeType="application/vnd.openxmlformats-officedocument"
+                     ".wordprocessingml.document"
+        )
+    else:
+        request = drive_service.files().get_media(fileId=doc_id)
 
     with open(local_path, "wb") as f:
         f.write(request.execute())

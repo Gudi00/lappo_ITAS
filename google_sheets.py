@@ -72,7 +72,7 @@ def get_google_credentials() -> Credentials:
 
 
 def _run_auth_flow() -> Credentials:
-    """Запускает OAuth2 авторизацию через браузер."""
+    """Запускает OAuth2 авторизацию через консоль (без браузерного callback)."""
     if not config.GOOGLE_CREDENTIALS_PATH.exists():
         raise FileNotFoundError(
             f"Файл учётных данных не найден: {config.GOOGLE_CREDENTIALS_PATH}\n"
@@ -83,7 +83,7 @@ def _run_auth_flow() -> Credentials:
     flow = InstalledAppFlow.from_client_secrets_file(
         str(config.GOOGLE_CREDENTIALS_PATH), config.GOOGLE_SCOPES
     )
-    return flow.run_local_server(port=0)
+    return flow.run_local_server(port=0, open_browser=True, timeout_seconds=120)
 
 
 def fetch_sheet_data(
