@@ -42,3 +42,65 @@ templates_cache/
 # OS
 .DS_Store
 Thumbs.db
+
+# ── Секреты (добавлено автоматически) ───────────────────────────────────────
+.env
+*.env
+.env.*
+!.env.example
+secrets.json
+secrets.yaml
+secrets.yml
+credentials.json
+*.pem
+*.key
+id_rsa
+id_ed25519
+
+# ── Python ───────────────────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Node ─────────────────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# ── ML / Модели ──────────────────────────────────────────────────────────────
+*.h5
+*.pkl
+*.pt
+*.pth
+*.gguf
+*.bin
+*.ckpt
+*.safetensors
+
+# ── AI-ассистенты и вайбкодинг ───────────────────────────────────────────────
+.cursorrules
+.cursorignore
+.aider*
+.continue/
+.codeium/
+.tabnine*
+.windsurf
+.windsurfrules
+.claude/
+.gemini/
+
+# ── Jupyter ──────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
