@@ -1,56 +1,25 @@
 """
-Движок обработки шаблонов .docx на основе docxtpl (Jinja2).
+Движок обработки шаблонов .docx.
 
 ═══════════════════════════════════════════════════════════════
 СИНТАКСИС ШАБЛОНА
 ═══════════════════════════════════════════════════════════════
 
-1. ТЕКСТОВЫЕ ПОЛЯ (заменяются с сохранением шрифта и форматирования):
-   {{ ФИО }}              — значение поля «ФИО» текущего студента
-   {{ Группа }}           — значение поля «Группа» текущего студента
+1. ТЕКСТОВЫЕ ПОЛЯ (для текущего студента):
+   {{ ФИО }}              — значение поля «ФИО»
+   {{ Группа }}           — значение поля «Группа»
 
-2. ТАБЛИЦА ВСЕХ СТУДЕНТОВ (существующая таблица в документе):
-   Создай таблицу в Word с заголовком и строкой данных.
-   В строке данных используй теги цикла:
+2. ТАБЛИЦА ВСЕХ СТУДЕНТОВ (через цикл в строке таблицы):
+   В строке таблицы разместите:
+   {% for s in students %}{{ s.ФИО }} {{ s.Группа }}{% endfor %}
 
-   ┌─────────────────────────────────┬───────────┐
-   │ ФИО                             │ Группа    │  ← заголовок (форматируй как хочешь)
-   ├─────────────────────────────────┼───────────┤
-   │ {%tr for s in students %}       │           │  ← первая ячейка строки-цикла
-   │ {{ s.ФИО }}                     │ {{ s.Группа }} │
-   ├─────────────────────────────────┼───────────┤
-   │ {%tr endfor %}                  │           │  ← строка-маркер конца (будет удалена)
-   └─────────────────────────────────┴───────────┘
-
-   Проще: весь цикл в одной строке:
-   | {%tr for s in students %}{{ s.ФИО }} | {{ s.Группа }}{%tr endfor %} |
-
-3. ТАБЛИЦА ТОЛЬКО ТЕКУЩЕГО СТУДЕНТА:
-   Используй current_row вместо students:
-   | {%tr for s in current_row %}{{ s.ФИО }} | {{ s.Группа }}{%tr endfor %} |
-
-═══════════════════════════════════════════════════════════════
-ПРИМЕР ШАБЛОНА ДИПЛОМА
-═══════════════════════════════════════════════════════════════
-
-   Настоящее удостоверение выдано {{ Фамилия Имя Отчество }},
-   студенту группы {{ Группа }}.
-
-   Сведения о студенте:
-   [таблица с {%tr for s in current_row %}...{%tr endfor %}]
-
-   Список всей группы:
-   [таблица с {%tr for s in students %}...{%tr endfor %}]
-
-═══════════════════════════════════════════════════════════════
-ПЕРЕМЕННЫЕ КОНТЕКСТА
-═══════════════════════════════════════════════════════════════
-   {{ ИмяСтолбца }}   — прямой доступ к полю текущего студента
-   {{ students }}     — список всех студентов (для цикла по таблице)
-   {{ current_row }}  — список из одного текущего студента
+   Строка будет продублирована для каждого студента.
 """
 
+import copy
 import re
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -60,27 +29,21 @@ from docxtpl import DocxTemplate
 import config
 from database import Database
 
+W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
 # Паттерн для поиска Jinja2-переменных: {{ имя }}
-# Игнорирует управляющие теги {% ... %} и точечный доступ {{ s.поле }}
 _VAR_PATTERN = re.compile(r"\{\{\s*([^%{}\s][^{}]*?)\s*\}\}")
 
 
 def find_placeholders(docx_path: Path) -> list[str]:
-    """
-    Находит все плейсхолдеры {{ ... }} в документе .docx.
-
-    Пропускает управляющие теги ({% for %}, {% if %} и т.д.)
-    и переменные с точечным доступом ({{ s.ФИО }} → поле s.ФИО).
-    Возвращает отсортированный список уникальных имён.
-    """
+    """Находит все плейсхолдеры {{ ... }} в документе."""
     doc = Document(str(docx_path))
     placeholders: set[str] = set()
 
     def _scan(text: str) -> None:
         for m in _VAR_PATTERN.finditer(text):
             name = m.group(1).strip()
-            # Пропускаем управляющие конструкции
-            if name.startswith(("%", "for ", "if ", "end")):
+            if name.startswith(("%", "tr ", "for ", "if ", "end")):
                 continue
             placeholders.add(name)
 
@@ -106,10 +69,7 @@ def _build_student_dict(
     row_data: dict[str, str],
     original_headers_map: Optional[dict[str, str]],
 ) -> dict[str, str]:
-    """
-    Строит словарь полей студента.
-    Включает как оригинальные (русские) имена, так и санированные (SQLite).
-    """
+    """Строит словарь полей студента с оригинальными и санированными именами."""
     student: dict[str, str] = {}
     if original_headers_map:
         for orig, safe in original_headers_map.items():
@@ -121,6 +81,140 @@ def _build_student_dict(
     return student
 
 
+def _flatten_cell_to_single_paragraph(cell_elem) -> None:
+    """
+    Объединяет все параграфы ячейки в один параграф с одним текстовым run.
+    Используется для строк с циклами, чтобы regex корректно работал с Jinja-тегами,
+    разбитыми переносами строк внутри ячейки.
+    """
+    paragraphs = cell_elem.findall(f'{W_NS}p')
+    if not paragraphs:
+        return
+
+    # Собираем весь текст из всех параграфов, разделяя их переводом строки
+    parts = []
+    for p in paragraphs:
+        texts = p.findall(f'.//{W_NS}t')
+        para_text = ''.join(t.text or '' for t in texts)
+        parts.append(para_text)
+    full_text = '\n'.join(parts)
+
+    # Оставляем первый параграф, объединяя все run'ы в один
+    first_p = paragraphs[0]
+    texts = first_p.findall(f'.//{W_NS}t')
+    if texts:
+        texts[0].text = full_text
+        texts[0].set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+        for t in texts[1:]:
+            t.text = ''
+    else:
+        # Нет существующих <w:t> — создаём новый run
+        from docx.oxml import OxmlElement
+        r = OxmlElement('w:r')
+        t = OxmlElement('w:t')
+        t.text = full_text
+        t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+        r.append(t)
+        first_p.append(r)
+
+    # Удаляем остальные параграфы
+    for p in paragraphs[1:]:
+        cell_elem.remove(p)
+
+
+def _find_loop_row(table) -> Optional[int]:
+    """Находит индекс строки, содержащей {% for s in students %}."""
+    for row_idx, row in enumerate(table.rows):
+        row_text = '\n'.join(cell.text for cell in row.cells)
+        if re.search(r'\{%\s*(?:tr\s+)?for\s+\w+\s+in\s+\w+', row_text):
+            return row_idx
+    return None
+
+
+def _substitute_student_in_row(row_element, student: dict[str, str]) -> None:
+    """
+    Подставляет значения студента в строку таблицы:
+    - {{ s.FieldName }} → фактическое значение
+    - Удаляет {% for %} и {% endfor %} markers
+
+    Сначала сплющивает содержимое каждой ячейки в один параграф, чтобы
+    regex корректно работал с Jinja-тегами, разбитыми на несколько параграфов.
+    """
+    def _replace(match, student_dict):
+        field_name = match.group(1)
+        # Убираем ведущие/конечные пробелы и переносы (но сохраняем внутренние)
+        field_name = field_name.strip()
+        if field_name in student_dict:
+            return student_dict[field_name]
+        # Пробуем санированную версию
+        sanitized = re.sub(r'\s+', '_', field_name).lower()
+        if sanitized in student_dict:
+            return student_dict[sanitized]
+        return ''
+
+    # Обрабатываем каждую ячейку
+    for tc in row_element.findall(f'.//{W_NS}tc'):
+        # Сплющиваем ячейку в один параграф
+        _flatten_cell_to_single_paragraph(tc)
+
+        # Теперь в ячейке один параграф с одним текстовым run — можем делать regex
+        for t in tc.findall(f'.//{W_NS}t'):
+            if not t.text:
+                continue
+            text = t.text
+
+            # Удаляем loop markers (с учётом возможных переносов)
+            text = re.sub(r'\{%\s*(?:tr\s+)?for[^%]*?%\}', '', text, flags=re.DOTALL)
+            text = re.sub(r'\{%\s*(?:tr\s+)?endfor[^%]*?%\}', '', text, flags=re.DOTALL)
+
+            # Заменяем {{ s.FieldName }} на фактическое значение
+            # DOTALL чтобы . матчил переносы (для полей с multi-line именами)
+            text = re.sub(
+                r'\{\{\s*s\.(.*?)\}\}',
+                lambda m: _replace(m, student),
+                text,
+                flags=re.DOTALL,
+            )
+
+            t.text = text
+
+
+def _expand_table_loops(template_path: Path, students_list: list[dict]) -> None:
+    """
+    Разворачивает циклы в таблицах:
+    - Находит строку с {% for s in students %}
+    - Дублирует её для каждого студента, подставляя значения
+    - Удаляет loop markers
+    """
+    doc = Document(str(template_path))
+
+    for table in doc.tables:
+        loop_row_idx = _find_loop_row(table)
+        if loop_row_idx is None:
+            continue
+
+        template_row = table.rows[loop_row_idx]
+        tr_element = template_row._element
+        parent = tr_element.getparent()
+        insert_pos = parent.index(tr_element)
+
+        # Генерируем строки для каждого студента (новые — вставляем ПЕРЕД шаблонной)
+        new_rows = []
+        for student in students_list:
+            tr_copy = copy.deepcopy(tr_element)
+            _substitute_student_in_row(tr_copy, student)
+            new_rows.append(tr_copy)
+
+        # Вставляем новые строки перед шаблонной строкой
+        for i, new_row in enumerate(new_rows):
+            parent.insert(insert_pos + i, new_row)
+
+        # Удаляем исходную шаблонную строку
+        parent.remove(tr_element)
+
+    doc.save(str(template_path))
+
+
 def generate_document(
     template_path: Path,
     row_data: dict[str, str],
@@ -128,20 +222,11 @@ def generate_document(
     all_rows_data: Optional[tuple[list[str], list[list]]] = None,
     original_headers_map: Optional[dict[str, str]] = None,
 ) -> Path:
-    """
-    Генерирует один документ из шаблона .docx через docxtpl.
-
-    Контекст Jinja2:
-      {{ ИмяСтолбца }}   — поле текущего студента (прямой доступ)
-      {{ students }}     — список всех студентов для цикла по таблице
-      {{ current_row }}  — список из одного текущего студента
-    """
-    tpl = DocxTemplate(str(template_path))
-
-    # Словарь текущего студента
+    """Генерирует один документ из шаблона."""
+    # Текущий студент (для прямых плейсхолдеров вне таблиц)
     current_student = _build_student_dict(row_data, original_headers_map)
 
-    # Список всех студентов для {{ students }}
+    # Все студенты (для таблиц с циклами)
     students_list: list[dict[str, str]] = []
     if all_rows_data:
         headers_raw, rows_raw = all_rows_data
@@ -154,20 +239,27 @@ def generate_document(
             for h_raw, val in zip(headers_raw, row):
                 val_str = str(val) if val is not None else ""
                 orig = rev.get(h_raw, h_raw)
-                s[orig] = val_str    # доступ по оригинальному имени: {{ s.ФИО }}
-                s[h_raw] = val_str   # доступ по санированному имени: {{ s.fio }}
+                s[orig] = val_str
+                s[h_raw] = val_str
             students_list.append(s)
 
-    context: dict = {
-        **current_student,              # прямой доступ: {{ ФИО }}
-        "students": students_list,      # все студенты: {% for s in students %}
-        "current_row": [current_student],  # текущий как список: {% for s in current_row %}
-    }
+    # Работаем с копией шаблона
+    with tempfile.TemporaryDirectory() as tmpdir:
+        work_template = Path(tmpdir) / template_path.name
+        shutil.copy2(template_path, work_template)
 
-    tpl.render(context, autoescape=False)
+        # Шаг 1: разворачиваем циклы в таблицах вручную (с прямой подстановкой)
+        _expand_table_loops(work_template, students_list)
 
-    output_path = config.OUTPUT_DIR / output_filename
-    tpl.save(str(output_path))
+        # Шаг 2: рендерим оставшиеся плейсхолдеры через docxtpl (нетабличные)
+        context: dict = {**current_student}
+
+        tpl = DocxTemplate(str(work_template))
+        tpl.render(context, autoescape=False)
+
+        output_path = config.OUTPUT_DIR / output_filename
+        tpl.save(str(output_path))
+
     return output_path
 
 
@@ -177,17 +269,7 @@ def generate_documents_for_all_rows(
     filename_column: Optional[str] = None,
     db: Optional[Database] = None,
 ) -> list[Path]:
-    """
-    Генерирует по одному документу на каждую строку данных в таблице.
-
-    Параметры:
-        template_path:    Путь к шаблону .docx
-        table_name:       Имя таблицы в SQLite
-        filename_column:  Столбец для имени выходного файла (None → «document_001.docx»)
-        db:               Экземпляр Database (создаётся автоматически если None)
-
-    Возвращает список путей к сгенерированным файлам.
-    """
+    """Генерирует по одному документу на каждую строку данных в таблице."""
     close_db = db is None
     if db is None:
         db = Database()
@@ -202,7 +284,6 @@ def generate_documents_for_all_rows(
         for idx, row in enumerate(all_rows):
             row_data = dict(zip(headers, row))
 
-            # Определяем имя выходного файла
             if filename_column and filename_column in row_data:
                 raw_name = str(row_data[filename_column])
                 safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", raw_name).strip()

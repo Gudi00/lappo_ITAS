@@ -1,671 +1,732 @@
 """
-Графический интерфейс приложения (tkinter).
-
-Вкладки:
-1. Google Sheets — загрузка данных из таблицы
-2. Шаблоны — скачивание и заполнение шаблонов
-3. Почта — отправка писем
-4. База данных — просмотр загруженных данных
+Графический интерфейс приложения в стиле macOS.
+Использует CustomTkinter для современного внешнего вида.
 """
 
-import json
 import threading
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, scrolledtext
+from tkinter import messagebox, filedialog
+from tkinter import ttk as tkttk
 from pathlib import Path
-from typing import Optional
+
+import customtkinter as ctk
 
 import config
 from database import Database
 from google_sheets import sync_sheet_to_database, extract_sheet_id
 from google_docs import download_template, extract_doc_id
-from template_engine import (
-    find_placeholders,
-    generate_document,
-    generate_documents_for_all_rows,
-)
+from template_engine import find_placeholders, generate_documents_for_all_rows
 from email_sender import EmailSender
 
+# ── Тема ──────────────────────────────────────────────────────────────────────
+ctk.set_appearance_mode("light")
+ctk.set_default_color_theme("blue")
 
-class App(tk.Tk):
+# Цветовая палитра macOS
+_BG       = "#F2F2F7"   # фон окна / контент
+_SIDEBAR  = "#FFFFFF"   # боковая панель
+_CARD     = "#FFFFFF"   # карточки
+_ACCENT   = "#007AFF"   # синий Apple
+_ACCENT_H = "#0062CC"   # hover синий
+_TEXT1    = "#1C1C1E"   # основной текст
+_TEXT2    = "#8E8E93"   # второстепенный текст
+_BORDER   = "#D1D1D6"   # граница
+_SUCCESS  = "#34C759"   # зелёный
+_ERROR    = "#FF3B30"   # красный
+_ODD_ROW  = "#F9F9FB"   # нечётная строка таблицы
+
+_FONT     = "Helvetica Neue"
+_MONO     = "Menlo"
+
+
+# ── Вспомогательные виджеты ───────────────────────────────────────────────────
+
+class _NavButton(ctk.CTkButton):
+    """Кнопка бокового меню."""
+
+    def __init__(self, master, label: str, icon: str, **kw):
+        super().__init__(
+            master,
+            text=f"  {icon}   {label}",
+            anchor="w",
+            height=40,
+            corner_radius=8,
+            fg_color="transparent",
+            text_color=_TEXT1,
+            hover_color="#EBEBF0",
+            font=ctk.CTkFont(family=_FONT, size=14),
+            **kw,
+        )
+
+    def activate(self):
+        self.configure(fg_color=_ACCENT, text_color="white", hover_color=_ACCENT_H)
+
+    def deactivate(self):
+        self.configure(fg_color="transparent", text_color=_TEXT1, hover_color="#EBEBF0")
+
+
+# ── Главное окно ──────────────────────────────────────────────────────────────
+
+class App(ctk.CTk):
     """Главное окно приложения."""
 
     def __init__(self):
         super().__init__()
 
-        self.title("Автоматизация документов")
-        self.geometry("900x650")
-        self.minsize(750, 550)
+        self.title("DocFlow")
+        self.geometry("1060x700")
+        self.minsize(860, 580)
+        self.configure(fg_color=_BG)
 
-        # Инициализируем базу данных
         self.db = Database()
 
-        # Создаём вкладки
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        self._create_sheets_tab()
-        self._create_templates_tab()
-        self._create_email_tab()
-        self._create_database_tab()
-
-        # Строка состояния
-        self.status_var = tk.StringVar(value="Готово")
-        status_bar = ttk.Label(
-            self, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W
-        )
-        status_bar.pack(fill=tk.X, padx=10, pady=(0, 10))
-
-        # Обработка закрытия окна
+        self._build_ui()
+        self._show("sheets")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def _set_status(self, text: str):
-        """Обновляет строку состояния."""
-        self.status_var.set(text)
+    # ── Построение UI ─────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        # ── Боковая панель ──
+        sidebar = ctk.CTkFrame(
+            self, width=210, corner_radius=0,
+            fg_color=_SIDEBAR,
+            border_width=1, border_color=_BORDER,
+        )
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
+
+        # Логотип / название
+        ctk.CTkLabel(
+            sidebar, text="DocFlow",
+            font=ctk.CTkFont(family=_FONT, size=22, weight="bold"),
+            text_color=_TEXT1,
+        ).pack(padx=20, pady=(28, 2))
+
+        ctk.CTkLabel(
+            sidebar, text="Автоматизация документов",
+            font=ctk.CTkFont(family=_FONT, size=11),
+            text_color=_TEXT2,
+        ).pack(padx=20, pady=(0, 20))
+
+        ctk.CTkFrame(sidebar, height=1, fg_color=_BORDER).pack(fill="x", padx=16, pady=(0, 14))
+
+        # Навигация
+        nav = [
+            ("sheets",    "Google Sheets", "⊞"),
+            ("templates", "Шаблоны",       "⎘"),
+            ("email",     "Почта",         "✉"),
+            ("database",  "База данных",   "≡"),
+        ]
+        self._nav_btns: dict[str, _NavButton] = {}
+        for key, label, icon in nav:
+            btn = _NavButton(
+                sidebar, label=label, icon=icon,
+                command=lambda k=key: self._show(k),
+            )
+            btn.pack(fill="x", padx=10, pady=2)
+            self._nav_btns[key] = btn
+
+        # Статус — внизу боковой панели
+        ctk.CTkFrame(sidebar, height=1, fg_color=_BORDER).pack(
+            side="bottom", fill="x", padx=16, pady=(0, 12))
+        self._status_dot = ctk.CTkLabel(
+            sidebar, text="● Готово",
+            font=ctk.CTkFont(family=_FONT, size=12),
+            text_color=_SUCCESS, anchor="w",
+        )
+        self._status_dot.pack(side="bottom", padx=20, pady=(0, 16), fill="x")
+
+        # ── Контентная область ──
+        self._content = ctk.CTkFrame(self, corner_radius=0, fg_color=_BG)
+        self._content.pack(side="left", fill="both", expand=True)
+
+        # Секции
+        self._sections: dict[str, ctk.CTkFrame] = {}
+        builders = {
+            "sheets":    self._build_sheets,
+            "templates": self._build_templates,
+            "email":     self._build_email,
+            "database":  self._build_database,
+        }
+        for key, build_fn in builders.items():
+            f = ctk.CTkScrollableFrame(
+                self._content,
+                corner_radius=0, fg_color=_BG,
+                scrollbar_button_color=_BORDER,
+                scrollbar_button_hover_color=_TEXT2,
+            )
+            build_fn(f)
+            self._sections[key] = f
+
+    def _show(self, key: str):
+        for k, f in self._sections.items():
+            f.pack_forget()
+        self._sections[key].pack(fill="both", expand=True)
+        for k, btn in self._nav_btns.items():
+            btn.activate() if k == key else btn.deactivate()
+
+    # ── Утилиты ───────────────────────────────────────────────────────────────
+
+    def _status(self, text: str, ok: bool = True):
+        color, dot = (_SUCCESS, "●") if ok else (_ERROR, "⚠")
+        self._status_dot.configure(text=f"{dot} {text}", text_color=color)
         self.update_idletasks()
 
-    def _run_in_thread(self, target, *args):
-        """Запускает функцию в отдельном потоке, чтобы не блокировать GUI."""
-        thread = threading.Thread(target=target, args=args, daemon=True)
-        thread.start()
+    def _run(self, fn):
+        threading.Thread(target=fn, daemon=True).start()
 
-    # ================================================================
-    # ВКЛАДКА 1: Google Sheets
-    # ================================================================
-    def _create_sheets_tab(self):
-        """Вкладка загрузки данных из Google Sheets."""
-        frame = ttk.Frame(self.notebook, padding=15)
-        self.notebook.add(frame, text="  Google Sheets  ")
+    # ── Виджеты-фабрики ───────────────────────────────────────────────────────
 
-        # URL ввод
-        ttk.Label(frame, text="Ссылка на Google Sheets:").pack(anchor=tk.W)
-        self.sheet_url_var = tk.StringVar()
-        url_entry = ttk.Entry(frame, textvariable=self.sheet_url_var, width=80)
-        url_entry.pack(fill=tk.X, pady=(5, 10))
+    @staticmethod
+    def _title(parent, text: str, subtitle: str = ""):
+        ctk.CTkLabel(
+            parent, text=text, anchor="w",
+            font=ctk.CTkFont(family=_FONT, size=26, weight="bold"),
+            text_color=_TEXT1,
+        ).pack(anchor="w", padx=32, pady=(32, 0))
+        if subtitle:
+            ctk.CTkLabel(
+                parent, text=subtitle, anchor="w",
+                font=ctk.CTkFont(family=_FONT, size=13),
+                text_color=_TEXT2,
+            ).pack(anchor="w", padx=32, pady=(4, 24))
+        else:
+            ctk.CTkFrame(parent, height=1, fg_color=_BORDER).pack(
+                fill="x", padx=32, pady=(16, 24))
 
-        # Диапазон (опционально)
-        range_frame = ttk.Frame(frame)
-        range_frame.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(range_frame, text="Диапазон (необязательно):").pack(
-            side=tk.LEFT
+    @staticmethod
+    def _card(parent, **kw) -> ctk.CTkFrame:
+        return ctk.CTkFrame(
+            parent, fg_color=_CARD, corner_radius=12,
+            border_width=1, border_color=_BORDER, **kw)
+
+    @staticmethod
+    def _lbl(parent, text: str, secondary=False) -> ctk.CTkLabel:
+        return ctk.CTkLabel(
+            parent, text=text, anchor="w",
+            font=ctk.CTkFont(family=_FONT, size=13),
+            text_color=_TEXT2 if secondary else _TEXT1,
         )
-        self.sheet_range_var = tk.StringVar()
-        ttk.Entry(
-            range_frame, textvariable=self.sheet_range_var, width=30
-        ).pack(side=tk.LEFT, padx=(10, 0))
-        ttk.Label(
-            range_frame, text="Например: Лист1!A:Z", foreground="gray"
-        ).pack(side=tk.LEFT, padx=(10, 0))
 
-        # Кнопка загрузки
-        self.btn_load_sheet = ttk.Button(
-            frame, text="Загрузить данные", command=self._load_sheet
+    @staticmethod
+    def _entry(parent, var=None, hint="", width=None) -> ctk.CTkEntry:
+        kw = dict(
+            corner_radius=8, border_width=1, border_color=_BORDER,
+            fg_color="white", text_color=_TEXT1,
+            placeholder_text=hint,
+            font=ctk.CTkFont(family=_FONT, size=13),
         )
-        self.btn_load_sheet.pack(pady=10)
+        if var is not None:
+            kw["textvariable"] = var
+        if width:
+            kw["width"] = width
+        return ctk.CTkEntry(parent, **kw)
 
-        # Лог операций
-        ttk.Label(frame, text="Журнал:").pack(anchor=tk.W)
-        self.sheets_log = scrolledtext.ScrolledText(
-            frame, height=12, state=tk.DISABLED, wrap=tk.WORD
+    @staticmethod
+    def _btn(parent, text: str, cmd, primary=True, width=None) -> ctk.CTkButton:
+        kw = dict(
+            text=text, command=cmd,
+            corner_radius=8, height=36,
+            font=ctk.CTkFont(family=_FONT, size=13, weight="bold"),
         )
-        self.sheets_log.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+        if primary:
+            kw.update(fg_color=_ACCENT, hover_color=_ACCENT_H, text_color="white")
+        else:
+            kw.update(fg_color="#E8E8ED", hover_color="#D8D8DD", text_color=_TEXT1)
+        if width:
+            kw["width"] = width
+        return ctk.CTkButton(parent, **kw)
 
-        # Список загруженных таблиц
-        ttk.Label(frame, text="Загруженные таблицы:").pack(
-            anchor=tk.W, pady=(10, 0)
+    @staticmethod
+    def _logbox(parent, height=170) -> ctk.CTkTextbox:
+        return ctk.CTkTextbox(
+            parent, height=height, corner_radius=8,
+            border_width=1, border_color=_BORDER,
+            fg_color="#F8F8FA", text_color=_TEXT1,
+            font=ctk.CTkFont(family=_MONO, size=12),
+            state="disabled", wrap="word",
         )
-        self.sheets_listbox = tk.Listbox(frame, height=4)
-        self.sheets_listbox.pack(fill=tk.X, pady=(5, 0))
+
+    @staticmethod
+    def _append(box: ctk.CTkTextbox, msg: str):
+        box.configure(state="normal")
+        box.insert("end", msg + "\n")
+        box.see("end")
+        box.configure(state="disabled")
+
+    @staticmethod
+    def _combo(parent, var, width=260) -> ctk.CTkComboBox:
+        return ctk.CTkComboBox(
+            parent, variable=var, state="readonly", width=width,
+            corner_radius=8, border_color=_BORDER, fg_color="white",
+            button_color=_BORDER, button_hover_color=_TEXT2,
+            font=ctk.CTkFont(family=_FONT, size=13),
+            dropdown_font=ctk.CTkFont(family=_FONT, size=13),
+        )
+
+    # ── СЕКЦИЯ: Google Sheets ─────────────────────────────────────────────────
+
+    def _build_sheets(self, f):
+        self._title(f, "Google Sheets", "Загрузка данных из таблицы")
+
+        card = self._card(f)
+        card.pack(fill="x", padx=32, pady=(0, 16))
+
+        self._lbl(card, "Ссылка на таблицу").pack(anchor="w", padx=20, pady=(18, 4))
+        self._sheet_url = tk.StringVar()
+        self._entry(card, var=self._sheet_url,
+                    hint="https://docs.google.com/spreadsheets/d/…"
+                    ).pack(fill="x", padx=20, pady=(0, 14))
+
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=20, pady=(0, 18))
+        self._lbl(row, "Диапазон:").pack(side="left")
+        self._sheet_range = tk.StringVar()
+        self._entry(row, var=self._sheet_range, hint="Лист1!A:Z", width=200
+                    ).pack(side="left", padx=(10, 10))
+        self._lbl(row, "(необязательно)", secondary=True).pack(side="left")
+
+        self._btn_load = self._btn(card, "  Загрузить данные  ", self._load_sheet, width=190)
+        self._btn_load.pack(anchor="w", padx=20, pady=(0, 20))
+
+        self._lbl(f, "Журнал").pack(anchor="w", padx=32, pady=(0, 6))
+        self._log_sheets = self._logbox(f, height=160)
+        self._log_sheets.pack(fill="x", padx=32, pady=(0, 18))
+
+        self._lbl(f, "Загруженные таблицы").pack(anchor="w", padx=32, pady=(0, 6))
+        self._sheets_list = ctk.CTkScrollableFrame(
+            f, height=110, corner_radius=10,
+            fg_color=_CARD, border_width=1, border_color=_BORDER,
+        )
+        self._sheets_list.pack(fill="x", padx=32, pady=(0, 32))
         self._refresh_sheets_list()
 
-    def _log_sheets(self, message: str):
-        """Добавляет сообщение в лог вкладки Sheets."""
-        self.sheets_log.config(state=tk.NORMAL)
-        self.sheets_log.insert(tk.END, message + "\n")
-        self.sheets_log.see(tk.END)
-        self.sheets_log.config(state=tk.DISABLED)
-
     def _load_sheet(self):
-        """Загружает данные из Google Sheets."""
-        url = self.sheet_url_var.get().strip()
+        url = self._sheet_url.get().strip()
         if not url:
             messagebox.showwarning("Внимание", "Вставьте ссылку на таблицу.")
             return
-
-        sheet_id = extract_sheet_id(url)
-        if not sheet_id:
+        if not extract_sheet_id(url):
             messagebox.showerror("Ошибка", "Некорректная ссылка на Google Sheets.")
             return
+        self._btn_load.configure(state="disabled")
+        self._status("Загрузка данных…")
+        self._append(self._log_sheets, f"→ {url}")
 
-        self.btn_load_sheet.config(state=tk.DISABLED)
-        self._set_status("Загрузка данных из Google Sheets...")
-        self._log_sheets(f"Начинаю загрузку: {url}")
-
-        def do_load():
+        def task():
             try:
-                range_name = self.sheet_range_var.get().strip()
-                table_name, row_count = sync_sheet_to_database(
-                    url, range_name, self.db
-                )
-                self.after(0, lambda: self._on_sheet_loaded(
-                    table_name, row_count
-                ))
+                rng = self._sheet_range.get().strip()
+                tbl, cnt = sync_sheet_to_database(url, rng, self.db)
+                self.after(0, lambda: self._sheet_ok(tbl, cnt))
             except Exception as e:
-                self.after(0, lambda msg=str(e): self._on_sheet_error(msg))
+                self.after(0, lambda m=str(e): self._sheet_err(m))
 
-        self._run_in_thread(do_load)
+        self._run(task)
 
-    def _on_sheet_loaded(self, table_name: str, row_count: int):
-        """Вызывается после успешной загрузки данных."""
-        self.btn_load_sheet.config(state=tk.NORMAL)
-        self._set_status("Готово")
-        self._log_sheets(
-            f"Загружено: таблица '{table_name}', строк: {row_count}"
-        )
+    def _sheet_ok(self, tbl, cnt):
+        self._btn_load.configure(state="normal")
+        self._status("Готово")
+        self._append(self._log_sheets, f"✓ Загружено: «{tbl}», строк: {cnt}")
         self._refresh_sheets_list()
-        messagebox.showinfo(
-            "Успех",
-            f"Данные загружены!\n"
-            f"Таблица: {table_name}\n"
-            f"Строк: {row_count}"
-        )
+        messagebox.showinfo("Успех", f"Таблица: {tbl}\nСтрок: {cnt}")
 
-    def _on_sheet_error(self, error: str):
-        """Вызывается при ошибке загрузки."""
-        self.btn_load_sheet.config(state=tk.NORMAL)
-        self._set_status("Ошибка загрузки")
-        self._log_sheets(f"ОШИБКА: {error}")
-        messagebox.showerror("Ошибка загрузки", error)
+    def _sheet_err(self, err):
+        self._btn_load.configure(state="normal")
+        self._status("Ошибка", ok=False)
+        self._append(self._log_sheets, f"✗ {err}")
+        messagebox.showerror("Ошибка загрузки", err)
 
     def _refresh_sheets_list(self):
-        """Обновляет список загруженных таблиц."""
-        self.sheets_listbox.delete(0, tk.END)
-        for sheet in self.db.get_all_sheets():
-            display = (
-                f"{sheet['sheet_name'] or 'Без названия'} "
-                f"({sheet['table_name']}, "
-                f"строк: {sheet['row_count']})"
-            )
-            self.sheets_listbox.insert(tk.END, display)
+        for w in self._sheets_list.winfo_children():
+            w.destroy()
+        sheets = self.db.get_all_sheets()
+        if not sheets:
+            self._lbl(self._sheets_list, "Нет загруженных таблиц", secondary=True
+                      ).pack(padx=16, pady=12)
+            return
+        for s in sheets:
+            row = ctk.CTkFrame(self._sheets_list, fg_color="transparent")
+            row.pack(fill="x", pady=4, padx=12)
+            ctk.CTkLabel(
+                row, text=s["sheet_name"] or "Без названия",
+                font=ctk.CTkFont(family=_FONT, size=13, weight="bold"),
+                text_color=_TEXT1, anchor="w",
+            ).pack(side="left")
+            ctk.CTkLabel(
+                row, text=f"  ·  {s['row_count']} строк",
+                font=ctk.CTkFont(family=_FONT, size=12),
+                text_color=_TEXT2, anchor="w",
+            ).pack(side="left")
 
-    # ================================================================
-    # ВКЛАДКА 2: Шаблоны
-    # ================================================================
-    def _create_templates_tab(self):
-        """Вкладка работы с шаблонами Google Docs."""
-        frame = ttk.Frame(self.notebook, padding=15)
-        self.notebook.add(frame, text="  Шаблоны  ")
+    # ── СЕКЦИЯ: Шаблоны ───────────────────────────────────────────────────────
 
-        # URL шаблона
-        ttk.Label(frame, text="Ссылка на шаблон Google Docs:").pack(
-            anchor=tk.W
-        )
-        self.doc_url_var = tk.StringVar()
-        ttk.Entry(frame, textvariable=self.doc_url_var, width=80).pack(
-            fill=tk.X, pady=(5, 10)
-        )
+    def _build_templates(self, f):
+        self._title(f, "Шаблоны", "Скачивание и генерация документов")
 
-        # Кнопка скачивания шаблона
-        self.btn_download_template = ttk.Button(
-            frame, text="Скачать шаблон",
-            command=self._download_template
-        )
-        self.btn_download_template.pack(pady=5)
+        # Карточка: скачать шаблон
+        c1 = self._card(f)
+        c1.pack(fill="x", padx=32, pady=(0, 16))
 
-        # Выбор таблицы для данных
-        select_frame = ttk.Frame(frame)
-        select_frame.pack(fill=tk.X, pady=10)
+        self._lbl(c1, "Ссылка на шаблон Google Docs").pack(
+            anchor="w", padx=20, pady=(18, 4))
+        self._doc_url = tk.StringVar()
+        self._entry(c1, var=self._doc_url,
+                    hint="https://docs.google.com/document/d/…"
+                    ).pack(fill="x", padx=20, pady=(0, 14))
+        self._btn_dl = self._btn(c1, "  Скачать шаблон  ",
+                                 self._download_template, width=180)
+        self._btn_dl.pack(anchor="w", padx=20, pady=(0, 20))
 
-        ttk.Label(select_frame, text="Таблица с данными:").pack(
-            side=tk.LEFT
-        )
-        self.template_table_var = tk.StringVar()
-        self.template_table_combo = ttk.Combobox(
-            select_frame, textvariable=self.template_table_var,
-            state="readonly", width=40
-        )
-        self.template_table_combo.pack(side=tk.LEFT, padx=(10, 0))
+        # Карточка: генерация
+        c2 = self._card(f)
+        c2.pack(fill="x", padx=32, pady=(0, 16))
 
-        ttk.Button(
-            select_frame, text="Обновить", command=self._refresh_table_combo
-        ).pack(side=tk.LEFT, padx=(5, 0))
+        r1 = ctk.CTkFrame(c2, fg_color="transparent")
+        r1.pack(fill="x", padx=20, pady=(18, 10))
+        self._lbl(r1, "Таблица с данными:").pack(side="left")
+        self._tpl_table = tk.StringVar()
+        self._tpl_combo = self._combo(r1, self._tpl_table, width=260)
+        self._tpl_combo.pack(side="left", padx=(10, 6))
+        self._btn(r1, "Обновить", self._refresh_tpl_tables,
+                  primary=False, width=90).pack(side="left")
 
-        # Столбец для имени файла
-        name_frame = ttk.Frame(frame)
-        name_frame.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(
-            name_frame,
-            text="Столбец для имени файла (необязательно):"
-        ).pack(side=tk.LEFT)
-        self.filename_column_var = tk.StringVar()
-        ttk.Entry(
-            name_frame, textvariable=self.filename_column_var, width=25
-        ).pack(side=tk.LEFT, padx=(10, 0))
+        r2 = ctk.CTkFrame(c2, fg_color="transparent")
+        r2.pack(fill="x", padx=20, pady=(0, 14))
+        self._lbl(r2, "Столбец для имён файлов:").pack(side="left")
+        self._filename_col = tk.StringVar()
+        self._entry(r2, var=self._filename_col,
+                    hint="необязательно", width=200
+                    ).pack(side="left", padx=(10, 0))
 
+        self._btn_gen = self._btn(c2, "  Сгенерировать документы  ",
+                                  self._generate_docs, width=230)
+        self._btn_gen.pack(anchor="w", padx=20, pady=(4, 20))
 
-        # Кнопка генерации
-        self.btn_generate = ttk.Button(
-            frame, text="Сгенерировать документы",
-            command=self._generate_documents
-        )
-        self.btn_generate.pack(pady=5)
+        self._lbl(f, "Журнал").pack(anchor="w", padx=32, pady=(0, 6))
+        self._log_tpl = self._logbox(f, height=220)
+        self._log_tpl.pack(fill="x", padx=32, pady=(0, 32))
 
-        # Лог
-        ttk.Label(frame, text="Журнал:").pack(anchor=tk.W, pady=(10, 0))
-        self.templates_log = scrolledtext.ScrolledText(
-            frame, height=10, state=tk.DISABLED, wrap=tk.WORD
-        )
-        self.templates_log.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+        self._refresh_tpl_tables()
 
-        self._refresh_table_combo()
-
-    def _log_templates(self, message: str):
-        """Добавляет сообщение в лог вкладки Шаблоны."""
-        self.templates_log.config(state=tk.NORMAL)
-        self.templates_log.insert(tk.END, message + "\n")
-        self.templates_log.see(tk.END)
-        self.templates_log.config(state=tk.DISABLED)
-
-    def _refresh_table_combo(self):
-        """Обновляет выпадающий список таблиц."""
+    def _refresh_tpl_tables(self):
         tables = self.db.get_table_names()
-        self.template_table_combo["values"] = tables
-        if tables and not self.template_table_var.get():
-            self.template_table_var.set(tables[0])
+        self._tpl_combo.configure(values=tables)
+        if tables and not self._tpl_table.get():
+            self._tpl_table.set(tables[0])
+        # Синхронизируем с вкладкой БД
+        if hasattr(self, "_db_combo"):
+            self._db_combo.configure(values=tables)
 
     def _download_template(self):
-        """Скачивает шаблон из Google Docs."""
-        url = self.doc_url_var.get().strip()
+        url = self._doc_url.get().strip()
         if not url:
-            messagebox.showwarning(
-                "Внимание", "Вставьте ссылку на шаблон Google Docs."
-            )
+            messagebox.showwarning("Внимание", "Вставьте ссылку на шаблон.")
             return
-
         if not extract_doc_id(url):
-            messagebox.showerror(
-                "Ошибка", "Некорректная ссылка на Google Docs."
-            )
+            messagebox.showerror("Ошибка", "Некорректная ссылка на Google Docs.")
             return
+        self._btn_dl.configure(state="disabled")
+        self._status("Скачивание шаблона…")
+        self._append(self._log_tpl, f"→ Скачиваю: {url}")
 
-        self.btn_download_template.config(state=tk.DISABLED)
-        self._set_status("Скачивание шаблона...")
-        self._log_templates(f"Скачиваю шаблон: {url}")
-
-        def do_download():
+        def task():
             try:
-                local_path = download_template(url, self.db)
-                placeholders = find_placeholders(local_path)
-                self.after(0, lambda: self._on_template_downloaded(
-                    local_path, placeholders
-                ))
+                path = download_template(url, self.db)
+                ph = find_placeholders(path)
+                self.after(0, lambda: self._dl_ok(path, ph))
             except Exception as e:
-                self.after(0, lambda msg=str(e): self._on_template_error(msg))
+                self.after(0, lambda m=str(e): self._dl_err(m))
 
-        self._run_in_thread(do_download)
+        self._run(task)
 
-    def _on_template_downloaded(self, path: Path, placeholders: list[str]):
-        """Вызывается после успешного скачивания шаблона."""
-        self.btn_download_template.config(state=tk.NORMAL)
-        self._set_status("Готово")
-        self._log_templates(f"Шаблон сохранён: {path}")
-        self._log_templates(
-            f"Найдены плейсхолдеры: {', '.join(placeholders) or 'нет'}"
-        )
+    def _dl_ok(self, path, placeholders):
+        self._btn_dl.configure(state="normal")
+        self._status("Готово")
+        self._append(self._log_tpl, f"✓ Сохранён: {path.name}")
+        self._append(self._log_tpl,
+                     f"  Плейсхолдеры: {', '.join(placeholders) or 'не найдены'}")
 
-    def _on_template_error(self, error: str):
-        """Вызывается при ошибке скачивания шаблона."""
-        self.btn_download_template.config(state=tk.NORMAL)
-        self._set_status("Ошибка")
-        self._log_templates(f"ОШИБКА: {error}")
-        messagebox.showerror("Ошибка", error)
+    def _dl_err(self, err):
+        self._btn_dl.configure(state="normal")
+        self._status("Ошибка", ok=False)
+        self._append(self._log_tpl, f"✗ {err}")
+        messagebox.showerror("Ошибка скачивания", err)
 
-    def _generate_documents(self):
-        """Генерирует документы из шаблона."""
-        table_name = self.template_table_var.get()
-        if not table_name:
-            messagebox.showwarning(
-                "Внимание", "Выберите таблицу с данными."
-            )
+    def _generate_docs(self):
+        tbl = self._tpl_table.get()
+        if not tbl:
+            messagebox.showwarning("Внимание", "Выберите таблицу с данными.")
             return
-
-        # Ищем последний скачанный шаблон
         templates = self.db.get_all_templates()
         if not templates:
-            messagebox.showwarning(
-                "Внимание", "Сначала скачайте шаблон."
-            )
+            messagebox.showwarning("Внимание", "Сначала скачайте шаблон.")
             return
-
-        template_info = templates[0]  # Последний скачанный
-        template_path = Path(template_info["local_path"])
-
-        if not template_path.exists():
-            messagebox.showerror(
-                "Ошибка",
-                f"Файл шаблона не найден: {template_path}\n"
-                f"Скачайте шаблон заново."
-            )
+        tpl_path = Path(templates[0]["local_path"])
+        if not tpl_path.exists():
+            messagebox.showerror("Ошибка", f"Файл шаблона не найден:\n{tpl_path}")
             return
+        self._btn_gen.configure(state="disabled")
+        self._status("Генерация документов…")
 
-        self.btn_generate.config(state=tk.DISABLED)
-        self._set_status("Генерация документов...")
-
-        def do_generate():
+        def task():
             try:
-                filename_col = self.filename_column_var.get().strip() or None
+                col = self._filename_col.get().strip() or None
                 files = generate_documents_for_all_rows(
-                    template_path=template_path,
-                    table_name=table_name,
-                    filename_column=filename_col,
-                    db=self.db
+                    template_path=tpl_path,
+                    table_name=tbl,
+                    filename_column=col,
+                    db=self.db,
                 )
-                self.after(0, lambda: self._on_documents_generated(files))
+                self.after(0, lambda: self._gen_ok(files))
             except Exception as e:
-                self.after(0, lambda msg=str(e): self._on_generate_error(msg))
+                self.after(0, lambda m=str(e): self._gen_err(m))
 
-        self._run_in_thread(do_generate)
+        self._run(task)
 
-    def _on_documents_generated(self, files: list[Path]):
-        """Вызывается после успешной генерации документов."""
-        self.btn_generate.config(state=tk.NORMAL)
-        self._set_status("Готово")
-        self._log_templates(f"Сгенерировано документов: {len(files)}")
+    def _gen_ok(self, files):
+        self._btn_gen.configure(state="normal")
+        self._status("Готово")
+        self._append(self._log_tpl, f"✓ Сгенерировано: {len(files)} документов")
         for f in files:
-            self._log_templates(f"  -> {f}")
-        messagebox.showinfo(
-            "Успех",
-            f"Сгенерировано {len(files)} документов.\n"
-            f"Папка: {config.OUTPUT_DIR}"
+            self._append(self._log_tpl, f"    {f.name}")
+        messagebox.showinfo("Успех",
+                            f"Сгенерировано {len(files)} документов.\n"
+                            f"Папка: {config.OUTPUT_DIR}")
+
+    def _gen_err(self, err):
+        self._btn_gen.configure(state="normal")
+        self._status("Ошибка генерации", ok=False)
+        self._append(self._log_tpl, f"✗ {err}")
+        messagebox.showerror("Ошибка генерации", err)
+
+    # ── СЕКЦИЯ: Почта ─────────────────────────────────────────────────────────
+
+    def _build_email(self, f):
+        self._title(f, "Почта", "Отправка писем студентам")
+
+        card = self._card(f)
+        card.pack(fill="x", padx=32, pady=(0, 16))
+
+        self._lbl(card, "Получатель (несколько — через ;)").pack(
+            anchor="w", padx=20, pady=(18, 4))
+        self._email_to = tk.StringVar()
+        self._entry(card, var=self._email_to,
+                    hint="user@example.com; user2@example.com"
+                    ).pack(fill="x", padx=20, pady=(0, 14))
+
+        self._lbl(card, "Тема письма").pack(anchor="w", padx=20, pady=(0, 4))
+        self._email_subj = tk.StringVar()
+        self._entry(card, var=self._email_subj, hint="Тема"
+                    ).pack(fill="x", padx=20, pady=(0, 14))
+
+        self._lbl(card, "Текст письма").pack(anchor="w", padx=20, pady=(0, 4))
+        self._email_body = ctk.CTkTextbox(
+            card, height=110, corner_radius=8,
+            border_width=1, border_color=_BORDER,
+            fg_color="white", text_color=_TEXT1,
+            font=ctk.CTkFont(family=_FONT, size=13),
         )
+        self._email_body.pack(fill="x", padx=20, pady=(0, 14))
 
-    def _on_generate_error(self, error: str):
-        """Вызывается при ошибке генерации."""
-        self.btn_generate.config(state=tk.NORMAL)
-        self._set_status("Ошибка генерации")
-        self._log_templates(f"ОШИБКА: {error}")
-        messagebox.showerror("Ошибка генерации", error)
+        # Вложение
+        ar = ctk.CTkFrame(card, fg_color="transparent")
+        ar.pack(fill="x", padx=20, pady=(0, 14))
+        self._lbl(ar, "Вложение:").pack(side="left")
+        self._attach = tk.StringVar()
+        self._entry(ar, var=self._attach, hint="путь к файлу", width=330
+                    ).pack(side="left", padx=(10, 6))
+        self._btn(ar, "Выбрать…", self._pick_attach, primary=False, width=100
+                  ).pack(side="left")
 
-    # ================================================================
-    # ВКЛАДКА 3: Почта
-    # ================================================================
-    def _create_email_tab(self):
-        """Вкладка отправки писем."""
-        frame = ttk.Frame(self.notebook, padding=15)
-        self.notebook.add(frame, text="  Почта  ")
+        # Тестовый режим
+        self._dry_run = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            card, text="Тестовый режим (письма не отправляются)",
+            variable=self._dry_run,
+            corner_radius=4, fg_color=_ACCENT, hover_color=_ACCENT_H,
+            font=ctk.CTkFont(family=_FONT, size=13), text_color=_TEXT1,
+        ).pack(anchor="w", padx=20, pady=(0, 14))
 
-        # Получатель
-        ttk.Label(frame, text="Получатель (или несколько через ;):").pack(
-            anchor=tk.W
+        self._btn_send = self._btn(card, "  Отправить  ", self._send_email, width=150)
+        self._btn_send.pack(anchor="w", padx=20, pady=(0, 20))
+
+        self._lbl(f, "Журнал отправки").pack(anchor="w", padx=32, pady=(0, 6))
+        self._log_email = self._logbox(f, height=200)
+        self._log_email.pack(fill="x", padx=32, pady=(0, 32))
+
+    def _pick_attach(self):
+        p = filedialog.askopenfilename(
+            title="Выберите файл",
+            filetypes=[("Word", "*.docx"), ("PDF", "*.pdf"), ("Все", "*.*")],
         )
-        self.email_to_var = tk.StringVar()
-        ttk.Entry(frame, textvariable=self.email_to_var, width=60).pack(
-            fill=tk.X, pady=(5, 10)
-        )
-
-        # Тема
-        ttk.Label(frame, text="Тема письма:").pack(anchor=tk.W)
-        self.email_subject_var = tk.StringVar()
-        ttk.Entry(frame, textvariable=self.email_subject_var, width=60).pack(
-            fill=tk.X, pady=(5, 10)
-        )
-
-        # Текст письма
-        ttk.Label(frame, text="Текст письма:").pack(anchor=tk.W)
-        self.email_body_text = scrolledtext.ScrolledText(
-            frame, height=8, wrap=tk.WORD
-        )
-        self.email_body_text.pack(fill=tk.BOTH, expand=True, pady=(5, 10))
-
-        # Прикрепить файл
-        attach_frame = ttk.Frame(frame)
-        attach_frame.pack(fill=tk.X, pady=(0, 10))
-        self.attachment_var = tk.StringVar()
-        ttk.Label(attach_frame, text="Вложение:").pack(side=tk.LEFT)
-        ttk.Entry(
-            attach_frame, textvariable=self.attachment_var, width=50
-        ).pack(side=tk.LEFT, padx=(10, 5))
-        ttk.Button(
-            attach_frame, text="Выбрать...",
-            command=self._select_attachment
-        ).pack(side=tk.LEFT)
-
-        # Галочка тестового режима
-        self.dry_run_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            frame,
-            text="Тестовый режим (письма НЕ отправляются)",
-            variable=self.dry_run_var
-        ).pack(anchor=tk.W, pady=(0, 10))
-
-        # Кнопки
-        btn_frame = ttk.Frame(frame)
-        btn_frame.pack()
-        self.btn_send_email = ttk.Button(
-            btn_frame, text="Отправить", command=self._send_email
-        )
-        self.btn_send_email.pack(side=tk.LEFT, padx=5)
-
-        # Лог отправки
-        ttk.Label(frame, text="Журнал отправки:").pack(
-            anchor=tk.W, pady=(10, 0)
-        )
-        self.email_log_text = scrolledtext.ScrolledText(
-            frame, height=5, state=tk.DISABLED, wrap=tk.WORD
-        )
-        self.email_log_text.pack(fill=tk.X, pady=(5, 0))
-
-    def _log_email(self, message: str):
-        """Добавляет сообщение в лог вкладки Почта."""
-        self.email_log_text.config(state=tk.NORMAL)
-        self.email_log_text.insert(tk.END, message + "\n")
-        self.email_log_text.see(tk.END)
-        self.email_log_text.config(state=tk.DISABLED)
-
-    def _select_attachment(self):
-        """Открывает диалог выбора файла для вложения."""
-        path = filedialog.askopenfilename(
-            title="Выберите файл для вложения",
-            filetypes=[
-                ("Документы Word", "*.docx"),
-                ("PDF файлы", "*.pdf"),
-                ("Все файлы", "*.*"),
-            ]
-        )
-        if path:
-            self.attachment_var.set(path)
+        if p:
+            self._attach.set(p)
 
     def _send_email(self):
-        """Отправляет письмо."""
-        recipients_str = self.email_to_var.get().strip()
-        subject = self.email_subject_var.get().strip()
-        body = self.email_body_text.get("1.0", tk.END).strip()
-
-        if not recipients_str:
+        to = self._email_to.get().strip()
+        subj = self._email_subj.get().strip()
+        body = self._email_body.get("1.0", "end").strip()
+        if not to:
             messagebox.showwarning("Внимание", "Укажите получателя.")
             return
-        if not subject:
-            messagebox.showwarning("Внимание", "Укажите тему письма.")
+        if not subj:
+            messagebox.showwarning("Внимание", "Укажите тему.")
             return
         if not body:
             messagebox.showwarning("Внимание", "Введите текст письма.")
             return
+        self._btn_send.configure(state="disabled")
+        self._status("Отправка письма…")
 
-        self.btn_send_email.config(state=tk.DISABLED)
-        self._set_status("Отправка письма...")
-
-        def do_send():
+        def task():
             try:
-                sender = EmailSender(
-                    db=self.db, dry_run=self.dry_run_var.get()
-                )
-                attachment = self.attachment_var.get().strip() or None
-                attachment_path = Path(attachment) if attachment else None
-
-                # Разделяем получателей по ;
-                recipients = [
-                    r.strip() for r in recipients_str.split(";") if r.strip()
-                ]
-
-                results = {"sent": 0, "failed": 0, "errors": []}
-                for recipient in recipients:
+                sender = EmailSender(db=self.db, dry_run=self._dry_run.get())
+                ap = self._attach.get().strip()
+                attach_path = Path(ap) if ap else None
+                recipients = [r.strip() for r in to.split(";") if r.strip()]
+                res = {"sent": 0, "failed": 0, "errors": []}
+                for r in recipients:
                     try:
                         sender.send_email(
-                            to=recipient,
-                            subject=subject,
-                            body=body,
-                            attachment_path=attachment_path
-                        )
-                        results["sent"] += 1
+                            to=r, subject=subj, body=body,
+                            attachment_path=attach_path)
+                        res["sent"] += 1
                     except Exception as e:
-                        results["failed"] += 1
-                        results["errors"].append(f"{recipient}: {str(e)}")
-
-                self.after(0, lambda: self._on_email_sent(results))
+                        res["failed"] += 1
+                        res["errors"].append(f"{r}: {e}")
+                self.after(0, lambda: self._mail_ok(res))
             except Exception as e:
-                self.after(0, lambda msg=str(e): self._on_email_error(msg))
+                self.after(0, lambda m=str(e): self._mail_err(m))
 
-        self._run_in_thread(do_send)
+        self._run(task)
 
-    def _on_email_sent(self, results: dict):
-        """Вызывается после попытки отправки."""
-        self.btn_send_email.config(state=tk.NORMAL)
-        self._set_status("Готово")
-
-        mode = "ТЕСТ" if self.dry_run_var.get() else "Отправлено"
-        self._log_email(
-            f"[{mode}] Успешно: {results['sent']}, "
-            f"Ошибок: {results['failed']}"
-        )
-        for err in results["errors"]:
-            self._log_email(f"  Ошибка: {err}")
-
-        if results["failed"] == 0:
-            messagebox.showinfo(
-                "Результат",
-                f"{'Тест' if self.dry_run_var.get() else 'Отправка'} "
-                f"завершена.\nУспешно: {results['sent']}"
-            )
+    def _mail_ok(self, res):
+        self._btn_send.configure(state="normal")
+        self._status("Готово")
+        mode = "ТЕСТ" if self._dry_run.get() else "Отправлено"
+        self._append(self._log_email,
+                     f"[{mode}] ✓ {res['sent']}  ✗ {res['failed']}")
+        for err in res["errors"]:
+            self._append(self._log_email, f"  ✗ {err}")
+        if res["failed"] == 0:
+            messagebox.showinfo("Результат", f"Успешно: {res['sent']}")
         else:
-            messagebox.showwarning(
-                "Результат",
-                f"Успешно: {results['sent']}\n"
-                f"Ошибок: {results['failed']}"
-            )
+            messagebox.showwarning("Результат",
+                                   f"Успешно: {res['sent']}\nОшибок: {res['failed']}")
 
-    def _on_email_error(self, error: str):
-        """Вызывается при ошибке отправки."""
-        self.btn_send_email.config(state=tk.NORMAL)
-        self._set_status("Ошибка отправки")
-        self._log_email(f"ОШИБКА: {error}")
-        messagebox.showerror("Ошибка", error)
+    def _mail_err(self, err):
+        self._btn_send.configure(state="normal")
+        self._status("Ошибка отправки", ok=False)
+        self._append(self._log_email, f"✗ {err}")
+        messagebox.showerror("Ошибка", err)
 
-    # ================================================================
-    # ВКЛАДКА 4: База данных
-    # ================================================================
-    def _create_database_tab(self):
-        """Вкладка просмотра данных из БД."""
-        frame = ttk.Frame(self.notebook, padding=15)
-        self.notebook.add(frame, text="  База данных  ")
+    # ── СЕКЦИЯ: База данных ───────────────────────────────────────────────────
 
-        # Выбор таблицы
-        select_frame = ttk.Frame(frame)
-        select_frame.pack(fill=tk.X, pady=(0, 10))
+    def _build_database(self, f):
+        self._title(f, "База данных", "Просмотр загруженных данных")
 
-        ttk.Label(select_frame, text="Таблица:").pack(side=tk.LEFT)
-        self.db_table_var = tk.StringVar()
-        self.db_table_combo = ttk.Combobox(
-            select_frame, textvariable=self.db_table_var,
-            state="readonly", width=40
+        ctrl = self._card(f)
+        ctrl.pack(fill="x", padx=32, pady=(0, 16))
+
+        r = ctk.CTkFrame(ctrl, fg_color="transparent")
+        r.pack(fill="x", padx=20, pady=18)
+        self._lbl(r, "Таблица:").pack(side="left")
+        self._db_tbl = tk.StringVar()
+        self._db_combo = self._combo(r, self._db_tbl, width=280)
+        self._db_combo.pack(side="left", padx=(10, 6))
+        self._btn(r, "Обновить список", self._refresh_db, primary=False, width=130
+                  ).pack(side="left", padx=(0, 6))
+        self._btn(r, "Показать данные", self._show_data, width=140
+                  ).pack(side="left")
+
+        # Treeview
+        tree_card = self._card(f)
+        tree_card.pack(fill="both", expand=True, padx=32, pady=(0, 8))
+
+        tree_wrap = tk.Frame(tree_card, bg=_CARD)
+        tree_wrap.pack(fill="both", expand=True, padx=12, pady=12)
+
+        style = tkttk.Style()
+        style.theme_use("default")
+        style.configure(
+            "Mac.Treeview",
+            background="white", fieldbackground="white",
+            foreground=_TEXT1, rowheight=30,
+            font=(_FONT, 12), borderwidth=0,
         )
-        self.db_table_combo.pack(side=tk.LEFT, padx=(10, 5))
-
-        ttk.Button(
-            select_frame, text="Обновить список",
-            command=self._refresh_db_tables
-        ).pack(side=tk.LEFT, padx=5)
-
-        ttk.Button(
-            select_frame, text="Показать данные",
-            command=self._show_table_data
-        ).pack(side=tk.LEFT, padx=5)
-
-        # Таблица данных (Treeview)
-        tree_frame = ttk.Frame(frame)
-        tree_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.data_tree = ttk.Treeview(tree_frame, show="headings")
-        self.data_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        # Полосы прокрутки
-        v_scroll = ttk.Scrollbar(
-            tree_frame, orient=tk.VERTICAL, command=self.data_tree.yview
+        style.configure(
+            "Mac.Treeview.Heading",
+            background=_BG, foreground=_TEXT2,
+            font=(_FONT, 12, "bold"), relief="flat",
         )
-        v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.data_tree.configure(yscrollcommand=v_scroll.set)
-
-        h_scroll = ttk.Scrollbar(
-            frame, orient=tk.HORIZONTAL, command=self.data_tree.xview
-        )
-        h_scroll.pack(fill=tk.X)
-        self.data_tree.configure(xscrollcommand=h_scroll.set)
-
-        # Информация о таблице
-        self.db_info_var = tk.StringVar()
-        ttk.Label(frame, textvariable=self.db_info_var).pack(
-            anchor=tk.W, pady=(5, 0)
+        style.map(
+            "Mac.Treeview",
+            background=[("selected", "#E3EEFB")],
+            foreground=[("selected", _TEXT1)],
         )
 
-        self._refresh_db_tables()
+        self._tree = tkttk.Treeview(
+            tree_wrap, show="headings", style="Mac.Treeview")
+        vsb = tkttk.Scrollbar(tree_wrap, orient="vertical",
+                               command=self._tree.yview)
+        hsb = tkttk.Scrollbar(tree_wrap, orient="horizontal",
+                               command=self._tree.xview)
+        self._tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
 
-    def _refresh_db_tables(self):
-        """Обновляет список таблиц в выпадающем списке."""
+        self._tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tree_wrap.grid_rowconfigure(0, weight=1)
+        tree_wrap.grid_columnconfigure(0, weight=1)
+
+        self._db_info = tk.StringVar()
+        ctk.CTkLabel(
+            f, textvariable=self._db_info, anchor="w",
+            font=ctk.CTkFont(family=_FONT, size=12), text_color=_TEXT2,
+        ).pack(anchor="w", padx=32, pady=(4, 32))
+
+        self._refresh_db()
+
+    def _refresh_db(self):
         tables = self.db.get_table_names()
-        self.db_table_combo["values"] = tables
-        # Также обновляем комбобокс на вкладке шаблонов
-        self.template_table_combo["values"] = tables
-        if tables and not self.db_table_var.get():
-            self.db_table_var.set(tables[0])
+        self._db_combo.configure(values=tables)
+        if tables and not self._db_tbl.get():
+            self._db_tbl.set(tables[0])
+        if hasattr(self, "_tpl_combo"):
+            self._tpl_combo.configure(values=tables)
 
-    def _show_table_data(self):
-        """Отображает данные из выбранной таблицы."""
-        table_name = self.db_table_var.get()
-        if not table_name:
+    def _show_data(self):
+        tbl = self._db_tbl.get()
+        if not tbl:
             messagebox.showwarning("Внимание", "Выберите таблицу.")
             return
-
         try:
-            headers, rows = self.db.get_all_data(table_name)
-            original_map = self.db.get_original_headers(table_name)
+            headers, rows = self.db.get_all_data(tbl)
+            orig = self.db.get_original_headers(tbl)
+            rev = {v: k for k, v in orig.items()}
 
-            # Получаем оригинальные имена для отображения
-            reverse_map = {v: k for k, v in original_map.items()}
-
-            # Очищаем таблицу
-            self.data_tree.delete(*self.data_tree.get_children())
-            self.data_tree["columns"] = headers
-
+            self._tree.delete(*self._tree.get_children())
+            self._tree["columns"] = headers
             for col in headers:
-                display_name = reverse_map.get(col, col)
-                self.data_tree.heading(col, text=display_name)
-                self.data_tree.column(col, width=120, minwidth=60)
+                self._tree.heading(col, text=rev.get(col, col))
+                self._tree.column(col, width=140, minwidth=80)
+            for i, row in enumerate(rows):
+                tag = "odd" if i % 2 else "even"
+                self._tree.insert("", "end", values=row, tags=(tag,))
+            self._tree.tag_configure("odd", background=_ODD_ROW)
+            self._tree.tag_configure("even", background="white")
 
-            for row in rows:
-                self.data_tree.insert("", tk.END, values=row)
-
-            self.db_info_var.set(
-                f"Таблица: {table_name} | "
-                f"Столбцов: {len(headers)} | "
+            self._db_info.set(
+                f"Таблица: {tbl}   ·   "
+                f"Столбцов: {len(headers)}   ·   "
                 f"Строк: {len(rows)}"
             )
-
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось загрузить данные:\n{e}")
 
-    # ================================================================
-    # Общие методы
-    # ================================================================
+    # ── Закрытие ──────────────────────────────────────────────────────────────
+
     def _on_close(self):
-        """Обработка закрытия приложения."""
         self.db.close()
         self.destroy()
