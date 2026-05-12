@@ -400,22 +400,28 @@ class App(ctk.CTk):
                     hint="необязательно", width=200
                     ).pack(side="left", padx=(10, 0))
 
-        r3 = ctk.CTkFrame(c2, fg_color="transparent")
-        r3.pack(fill="x", padx=20, pady=(0, 10))
-        self._lbl(r3, "Группировать по:").pack(side="left")
-        self._group_by_col = tk.StringVar()
-        self._group_by_combo = self._combo(r3, self._group_by_col, width=260)
-        self._group_by_combo.pack(side="left", padx=(10, 6))
-        self._btn(r3, "Обновить", self._refresh_group_by_cols,
-                  primary=False, width=90).pack(side="left")
+        # ── Многоуровневая группировка ──
+        self._lbl(c2, "Уровни группировки:").pack(
+            anchor="w", padx=20, pady=(0, 4))
 
-        r4 = ctk.CTkFrame(c2, fg_color="transparent")
-        r4.pack(fill="x", padx=20, pady=(0, 14))
-        self._lbl(r4, "Формат заголовка группы:").pack(side="left")
-        self._group_label_tpl = tk.StringVar(value="Группа {value}")
-        self._entry(r4, var=self._group_label_tpl,
-                    hint="{value} — значение поля", width=260
-                    ).pack(side="left", padx=(10, 0))
+        # Список текущих уровней: [(col_name, label_tpl_var), ...]
+        self._group_levels: list[tuple[str, tk.StringVar]] = []
+
+        self._group_levels_frame = ctk.CTkFrame(
+            c2, fg_color="#F5F5F7", corner_radius=8,
+            border_width=1, border_color=_BORDER)
+        self._group_levels_frame.pack(fill="x", padx=20, pady=(0, 6))
+        self._rebuild_group_levels_ui()
+
+        r_add = ctk.CTkFrame(c2, fg_color="transparent")
+        r_add.pack(fill="x", padx=20, pady=(0, 14))
+        self._add_group_col = tk.StringVar()
+        self._add_group_combo = self._combo(r_add, self._add_group_col, width=200)
+        self._add_group_combo.pack(side="left", padx=(0, 6))
+        self._btn(r_add, "+ Добавить", self._add_group_level,
+                  primary=False, width=110).pack(side="left", padx=(0, 6))
+        self._btn(r_add, "Обновить список", self._refresh_group_by_cols,
+                  primary=False, width=130).pack(side="left")
 
         self._merge_left = tk.BooleanVar(value=True)
         self._merge_right = tk.BooleanVar(value=False)
@@ -466,19 +472,66 @@ class App(ctk.CTk):
             self._merge_left.set(False)
 
     def _refresh_group_by_cols(self):
-        """Обновляет список колонок для группировки по выбранной таблице."""
-        if not hasattr(self, "_group_by_combo"):
+        """Обновляет список доступных колонок для добавления уровня группировки."""
+        if not hasattr(self, "_add_group_combo"):
             return
         tbl = self._tpl_table.get()
-        cols = [""]  # пустое = без группировки
+        cols = [""]
         if tbl:
             try:
                 orig = self.db.get_original_headers(tbl)
-                # Показываем оригинальные (русские) имена столбцов
                 cols.extend(sorted(orig.keys()))
             except Exception:
                 pass
-        self._group_by_combo.configure(values=cols)
+        self._add_group_combo.configure(values=cols)
+
+    def _add_group_level(self):
+        """Добавляет выбранную колонку в список уровней группировки."""
+        col = self._add_group_col.get().strip()
+        if not col:
+            return
+        if any(c == col for c, _ in self._group_levels):
+            return  # дубликаты не добавляем
+        label_var = tk.StringVar(value="{value}")
+        self._group_levels.append((col, label_var))
+        self._rebuild_group_levels_ui()
+
+    def _remove_group_level(self, idx: int):
+        """Удаляет уровень группировки по индексу."""
+        if 0 <= idx < len(self._group_levels):
+            self._group_levels.pop(idx)
+            self._rebuild_group_levels_ui()
+
+    def _rebuild_group_levels_ui(self):
+        """Перестраивает виджет списка уровней группировки."""
+        for w in self._group_levels_frame.winfo_children():
+            w.destroy()
+
+        if not self._group_levels:
+            self._lbl(self._group_levels_frame,
+                      "Группировка не задана — все строки будут добавлены без разбивки",
+                      secondary=True).pack(padx=12, pady=8)
+            return
+
+        for i, (col, label_var) in enumerate(self._group_levels):
+            row = ctk.CTkFrame(self._group_levels_frame, fg_color="transparent")
+            row.pack(fill="x", padx=8, pady=4)
+
+            ctk.CTkLabel(
+                row, text=f"{i + 1}.", width=22, anchor="e",
+                font=ctk.CTkFont(family=_FONT, size=12), text_color=_TEXT2,
+            ).pack(side="left")
+            ctk.CTkLabel(
+                row, text=col, width=150, anchor="w",
+                font=ctk.CTkFont(family=_FONT, size=13, weight="bold"),
+                text_color=_TEXT1,
+            ).pack(side="left", padx=(4, 8))
+            self._entry(row, var=label_var,
+                        hint="напр. «Группа {value}»", width=180
+                        ).pack(side="left", padx=(0, 6))
+            self._btn(row, "×",
+                      lambda idx=i: self._remove_group_level(idx),
+                      primary=False, width=32).pack(side="left")
 
     def _download_template(self):
         url = self._doc_url.get().strip()
@@ -534,8 +587,11 @@ class App(ctk.CTk):
         def task():
             try:
                 col = self._filename_col.get().strip() or None
-                group_by = self._group_by_col.get().strip() or None
-                label_tpl = self._group_label_tpl.get().strip() or "{value}"
+                group_by = [c for c, _ in self._group_levels] or None
+                label_tpls = [
+                    v.get().strip() or "{value}"
+                    for _, v in self._group_levels
+                ] or None
                 merge_left = self._merge_left.get()
                 merge_right = self._merge_right.get()
                 files = generate_documents_for_all_rows(
@@ -544,7 +600,7 @@ class App(ctk.CTk):
                     filename_column=col,
                     db=self.db,
                     group_by=group_by,
-                    group_label_template=label_tpl,
+                    group_label_templates=label_tpls,
                     merge_empty_cells=merge_left or merge_right,
                     merge_right=merge_right,
                 )

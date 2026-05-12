@@ -235,16 +235,28 @@ def _make_group_header_row(template_row_elem, group_label: str, total_cols: int)
     else:
         # Нет текстового элемента — создаём
         from docx.oxml import OxmlElement
-        p = first_tc.find(f'{W_NS}p')
-        if p is None:
-            p = OxmlElement('w:p')
-            first_tc.append(p)
+        p_new = OxmlElement('w:p')
         r = OxmlElement('w:r')
         t = OxmlElement('w:t')
         t.text = group_label
         t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
         r.append(t)
-        p.append(r)
+        p_new.append(r)
+        first_tc.append(p_new)
+
+    # Выравниваем текст заголовка по левому краю
+    from docx.oxml import OxmlElement as _OxmlElement
+    p = first_tc.find(f'{W_NS}p')
+    if p is not None:
+        pPr = p.find(f'{W_NS}pPr')
+        if pPr is None:
+            pPr = _OxmlElement('w:pPr')
+            p.insert(0, pPr)
+        jc = pPr.find(f'{W_NS}jc')
+        if jc is None:
+            jc = _OxmlElement('w:jc')
+            pPr.append(jc)
+        jc.set(f'{W_NS}val', 'left')
 
     return row_copy
 
@@ -261,33 +273,90 @@ def _get_table_grid_cols(table_elem) -> int:
     return 1
 
 
-def _group_students(
+def _get_student_field(student: dict, field_name: str) -> str:
+    """Возвращает значение поля студента, пробуя оригинальное и санированное имя."""
+    val = student.get(field_name, '') or ''
+    if not val:
+        sanitized = re.sub(r'\s+', '_', field_name.strip()).lower()
+        val = student.get(sanitized, '') or ''
+    return val.strip() or '(без значения)'
+
+
+def _group_students_recursive(
     students_list: list[dict],
-    group_by: Optional[str],
-) -> list[tuple[Optional[str], list[dict]]]:
+    group_by_list: list[str],
+) -> list:
     """
-    Группирует студентов по значению поля group_by. Возвращает список пар
-    (значение_группы, список_студентов). Если group_by не задан, возвращается
-    одна пара (None, все_студенты).
+    Рекурсивно группирует студентов по нескольким уровням.
+
+    Возвращает:
+    - list[dict] если group_by_list пуст (студенты напрямую)
+    - list[tuple[str, list]] если group_by_list не пуст (группы с детьми)
     """
-    if not group_by:
-        return [(None, students_list)]
+    if not group_by_list:
+        return students_list
+
+    col = group_by_list[0]
+    rest = group_by_list[1:]
 
     groups: dict[str, list[dict]] = {}
     order: list[str] = []
     for s in students_list:
-        value = s.get(group_by) or ''
-        # Пробуем санированную версию, если прямого совпадения нет
-        if not value:
-            sanitized = re.sub(r'\s+', '_', group_by.strip()).lower()
-            value = s.get(sanitized) or ''
-        value = value.strip() or '(без группы)'
+        value = _get_student_field(s, col)
         if value not in groups:
             groups[value] = []
             order.append(value)
         groups[value].append(s)
 
-    return [(key, groups[key]) for key in order]
+    return [
+        (key, _group_students_recursive(groups[key], rest))
+        for key in order
+    ]
+
+
+def _expand_grouped_rows(
+    parent,
+    pos: int,
+    tr_element,
+    items: list,
+    level: int,
+    label_templates: list[str],
+    total_cols: int,
+    merge_empty_cells: bool,
+    merge_right: bool,
+) -> int:
+    """
+    Рекурсивно вставляет строки: заголовки групп и строки студентов.
+    Возвращает обновлённую позицию вставки.
+    """
+    def _get_label_template(lvl: int) -> str:
+        if label_templates:
+            return label_templates[min(lvl, len(label_templates) - 1)]
+        return "{value}"
+
+    for item in items:
+        if isinstance(item, tuple):
+            group_value, children = item
+            label = _get_label_template(level).format(value=group_value)
+            header = _make_group_header_row(tr_element, label, total_cols)
+            parent.insert(pos, header)
+            pos += 1
+            pos = _expand_grouped_rows(
+                parent, pos, tr_element, children, level + 1,
+                label_templates, total_cols, merge_empty_cells, merge_right,
+            )
+        else:
+            # item — словарь студента
+            tr_copy = copy.deepcopy(tr_element)
+            _substitute_student_in_row(tr_copy, item)
+            if merge_empty_cells:
+                if merge_right:
+                    _merge_empty_cells_right(tr_copy)
+                else:
+                    _merge_empty_cells_left(tr_copy)
+            parent.insert(pos, tr_copy)
+            pos += 1
+    return pos
 
 
 def _substitute_student_in_row(row_element, student: dict[str, str]) -> None:
@@ -341,22 +410,23 @@ def _substitute_student_in_row(row_element, student: dict[str, str]) -> None:
 def _expand_table_loops(
     template_path: Path,
     students_list: list[dict],
-    group_by: Optional[str] = None,
-    group_label_template: str = "{value}",
+    group_by: Optional[list[str]] = None,
+    group_label_templates: Optional[list[str]] = None,
     merge_empty_cells: bool = True,
     merge_right: bool = False,
 ) -> None:
     """
     Разворачивает циклы в таблицах:
     - Находит строку с {% for s in students %}
-    - Группирует студентов (если задан group_by) и для каждой группы вставляет
-      объединённую строку-заголовок с названием группы
+    - Рекурсивно группирует студентов по нескольким уровням (если задан group_by)
+    - Для каждой группы вставляет объединённую строку-заголовок
     - Дублирует строку шаблона для каждого студента, подставляя значения
-    - Удаляет loop markers
-    - Объединяет пустые ячейки с соседней (если merge_empty_cells):
-      merge_right=False — с левой, merge_right=True — с правой
+    - Объединяет пустые ячейки (если merge_empty_cells)
     """
     doc = Document(str(template_path))
+
+    group_by_list = group_by or []
+    label_tpls = group_label_templates or ["{value}"]
 
     for table in doc.tables:
         loop_row_idx = _find_loop_row(table)
@@ -370,33 +440,13 @@ def _expand_table_loops(
 
         total_cols = _get_table_grid_cols(table._tbl)
 
-        # Группируем студентов
-        groups = _group_students(students_list, group_by)
+        grouped = _group_students_recursive(students_list, group_by_list)
 
-        new_rows = []
-        for group_value, group_students in groups:
-            # Если задана группировка — вставляем строку-заголовок группы
-            if group_value is not None:
-                label = group_label_template.format(value=group_value)
-                header_row = _make_group_header_row(tr_element, label, total_cols)
-                new_rows.append(header_row)
+        _expand_grouped_rows(
+            parent, insert_pos, tr_element, grouped, 0,
+            label_tpls, total_cols, merge_empty_cells, merge_right,
+        )
 
-            # Строки для студентов группы
-            for student in group_students:
-                tr_copy = copy.deepcopy(tr_element)
-                _substitute_student_in_row(tr_copy, student)
-                if merge_empty_cells:
-                    if merge_right:
-                        _merge_empty_cells_right(tr_copy)
-                    else:
-                        _merge_empty_cells_left(tr_copy)
-                new_rows.append(tr_copy)
-
-        # Вставляем новые строки перед шаблонной строкой
-        for i, new_row in enumerate(new_rows):
-            parent.insert(insert_pos + i, new_row)
-
-        # Удаляем исходную шаблонную строку
         parent.remove(tr_element)
 
     doc.save(str(template_path))
@@ -408,16 +458,16 @@ def generate_document(
     output_filename: str,
     all_rows_data: Optional[tuple[list[str], list[list]]] = None,
     original_headers_map: Optional[dict[str, str]] = None,
-    group_by: Optional[str] = None,
-    group_label_template: str = "{value}",
+    group_by: Optional[list[str]] = None,
+    group_label_templates: Optional[list[str]] = None,
     merge_empty_cells: bool = True,
     merge_right: bool = False,
 ) -> Path:
     """
     Генерирует один документ из шаблона.
 
-    group_by: имя колонки для группировки студентов в таблице (например, "группы №").
-    group_label_template: формат строки-заголовка группы, где {value} — значение поля.
+    group_by: список колонок для многоуровневой группировки (например, ["Факультет", "Группа"]).
+    group_label_templates: шаблон заголовка для каждого уровня, {value} — значение поля.
     merge_empty_cells: объединять пустые ячейки с соседней.
     merge_right: True — объединять с правой, False — с левой.
     """
@@ -451,7 +501,7 @@ def generate_document(
             work_template,
             students_list,
             group_by=group_by,
-            group_label_template=group_label_template,
+            group_label_templates=group_label_templates,
             merge_empty_cells=merge_empty_cells,
             merge_right=merge_right,
         )
@@ -473,15 +523,16 @@ def generate_documents_for_all_rows(
     table_name: str,
     filename_column: Optional[str] = None,
     db: Optional[Database] = None,
-    group_by: Optional[str] = None,
-    group_label_template: str = "{value}",
+    group_by: Optional[list[str]] = None,
+    group_label_templates: Optional[list[str]] = None,
     merge_empty_cells: bool = True,
     merge_right: bool = False,
 ) -> list[Path]:
     """
     Генерирует по одному документу на каждую строку данных в таблице.
 
-    group_by: имя колонки для группировки студентов внутри таблицы документа.
+    group_by: список колонок для многоуровневой группировки.
+    group_label_templates: шаблоны заголовков по одному на каждый уровень.
     """
     close_db = db is None
     if db is None:
@@ -511,7 +562,7 @@ def generate_documents_for_all_rows(
                 all_rows_data=all_rows_data,
                 original_headers_map=original_map,
                 group_by=group_by,
-                group_label_template=group_label_template,
+                group_label_templates=group_label_templates,
                 merge_empty_cells=merge_empty_cells,
                 merge_right=merge_right,
             )
