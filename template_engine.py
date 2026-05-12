@@ -324,9 +324,13 @@ def _expand_grouped_rows(
     total_cols: int,
     merge_empty_cells: bool,
     merge_right: bool,
+    num_var: Optional[str] = None,
+    row_counter: Optional[list] = None,
 ) -> int:
     """
     Рекурсивно вставляет строки: заголовки групп и строки студентов.
+    num_var: колонка, значение которой заменяется порядковым номером строки.
+    row_counter: [int] — разделяемый счётчик строк.
     Возвращает обновлённую позицию вставки.
     """
     def _get_label_template(lvl: int) -> str:
@@ -344,11 +348,23 @@ def _expand_grouped_rows(
             pos = _expand_grouped_rows(
                 parent, pos, tr_element, children, level + 1,
                 label_templates, total_cols, merge_empty_cells, merge_right,
+                num_var=num_var, row_counter=row_counter,
             )
         else:
             # item — словарь студента
+            student = item
+            if num_var and row_counter is not None:
+                row_counter[0] += 1
+                student = dict(item)
+                # Добавляем переменную нумерации — она не из БД, просто счётчик
+                var_name = num_var.strip()
+                student[var_name] = str(row_counter[0])
+                # Также добавляем санированную версию на случай разного написания
+                sanitized = re.sub(r'\s+', '_', var_name).lower()
+                if sanitized != var_name:
+                    student[sanitized] = str(row_counter[0])
             tr_copy = copy.deepcopy(tr_element)
-            _substitute_student_in_row(tr_copy, item)
+            _substitute_student_in_row(tr_copy, student)
             if merge_empty_cells:
                 if merge_right:
                     _merge_empty_cells_right(tr_copy)
@@ -414,6 +430,7 @@ def _expand_table_loops(
     group_label_templates: Optional[list[str]] = None,
     merge_empty_cells: bool = True,
     merge_right: bool = False,
+    num_var: Optional[str] = None,
 ) -> None:
     """
     Разворачивает циклы в таблицах:
@@ -422,6 +439,7 @@ def _expand_table_loops(
     - Для каждой группы вставляет объединённую строку-заголовок
     - Дублирует строку шаблона для каждого студента, подставляя значения
     - Объединяет пустые ячейки (если merge_empty_cells)
+    - Нумерует строки данных, если указан num_var
     """
     doc = Document(str(template_path))
 
@@ -439,12 +457,13 @@ def _expand_table_loops(
         insert_pos = parent.index(tr_element)
 
         total_cols = _get_table_grid_cols(table._tbl)
-
         grouped = _group_students_recursive(students_list, group_by_list)
+        row_counter = [0]
 
         _expand_grouped_rows(
             parent, insert_pos, tr_element, grouped, 0,
             label_tpls, total_cols, merge_empty_cells, merge_right,
+            num_var=num_var, row_counter=row_counter,
         )
 
         parent.remove(tr_element)
@@ -462,6 +481,7 @@ def generate_document(
     group_label_templates: Optional[list[str]] = None,
     merge_empty_cells: bool = True,
     merge_right: bool = False,
+    num_var: Optional[str] = None,
 ) -> Path:
     """
     Генерирует один документ из шаблона.
@@ -470,6 +490,7 @@ def generate_document(
     group_label_templates: шаблон заголовка для каждого уровня, {value} — значение поля.
     merge_empty_cells: объединять пустые ячейки с соседней.
     merge_right: True — объединять с правой, False — с левой.
+    num_var: колонка, в которой значение заменяется порядковым номером строки.
     """
     # Текущий студент (для прямых плейсхолдеров вне таблиц)
     current_student = _build_student_dict(row_data, original_headers_map)
@@ -504,6 +525,7 @@ def generate_document(
             group_label_templates=group_label_templates,
             merge_empty_cells=merge_empty_cells,
             merge_right=merge_right,
+            num_var=num_var,
         )
 
         # Шаг 2: рендерим оставшиеся плейсхолдеры через docxtpl (нетабличные)
@@ -527,12 +549,14 @@ def generate_documents_for_all_rows(
     group_label_templates: Optional[list[str]] = None,
     merge_empty_cells: bool = True,
     merge_right: bool = False,
+    num_var: Optional[str] = None,
 ) -> list[Path]:
     """
     Генерирует по одному документу на каждую строку данных в таблице.
 
     group_by: список колонок для многоуровневой группировки.
     group_label_templates: шаблоны заголовков по одному на каждый уровень.
+    num_var: колонка для автонумерации строк (1, 2, 3, ...).
     """
     close_db = db is None
     if db is None:
@@ -565,6 +589,7 @@ def generate_documents_for_all_rows(
                 group_label_templates=group_label_templates,
                 merge_empty_cells=merge_empty_cells,
                 merge_right=merge_right,
+                num_var=num_var,
             )
             generated.append(path)
 

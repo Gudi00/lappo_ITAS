@@ -393,12 +393,22 @@ class App(ctk.CTk):
                   primary=False, width=90).pack(side="left")
 
         r2 = ctk.CTkFrame(c2, fg_color="transparent")
-        r2.pack(fill="x", padx=20, pady=(0, 14))
+        r2.pack(fill="x", padx=20, pady=(0, 10))
         self._lbl(r2, "Столбец для имён файлов:").pack(side="left")
         self._filename_col = tk.StringVar()
         self._entry(r2, var=self._filename_col,
                     hint="необязательно", width=200
                     ).pack(side="left", padx=(10, 0))
+
+        r_num = ctk.CTkFrame(c2, fg_color="transparent")
+        r_num.pack(fill="x", padx=20, pady=(0, 14))
+        self._lbl(r_num, "Нумерация строк  {{ s.").pack(side="left")
+        self._num_var = tk.StringVar(value="num")
+        self._entry(r_num, var=self._num_var, width=90
+                    ).pack(side="left", padx=(4, 0))
+        self._lbl(r_num, " }}").pack(side="left")
+        self._lbl(r_num, "   ← оставьте пустым чтобы не нумеровать",
+                  secondary=True).pack(side="left", padx=(8, 0))
 
         # ── Многоуровневая группировка ──
         self._lbl(c2, "Уровни группировки:").pack(
@@ -472,9 +482,7 @@ class App(ctk.CTk):
             self._merge_left.set(False)
 
     def _refresh_group_by_cols(self):
-        """Обновляет список доступных колонок для добавления уровня группировки."""
-        if not hasattr(self, "_add_group_combo"):
-            return
+        """Обновляет списки колонок для группировки и нумерации."""
         tbl = self._tpl_table.get()
         cols = [""]
         if tbl:
@@ -483,7 +491,8 @@ class App(ctk.CTk):
                 cols.extend(sorted(orig.keys()))
             except Exception:
                 pass
-        self._add_group_combo.configure(values=cols)
+        if hasattr(self, "_add_group_combo"):
+            self._add_group_combo.configure(values=cols)
 
     def _add_group_level(self):
         """Добавляет выбранную колонку в список уровней группировки."""
@@ -594,6 +603,7 @@ class App(ctk.CTk):
                 ] or None
                 merge_left = self._merge_left.get()
                 merge_right = self._merge_right.get()
+                num_var = self._num_var.get().strip() or None
                 files = generate_documents_for_all_rows(
                     template_path=tpl_path,
                     table_name=tbl,
@@ -603,6 +613,7 @@ class App(ctk.CTk):
                     group_label_templates=label_tpls,
                     merge_empty_cells=merge_left or merge_right,
                     merge_right=merge_right,
+                    num_var=num_var,
                 )
                 self.after(0, lambda: self._gen_ok(files))
             except Exception as e:
