@@ -386,6 +386,7 @@ class App(ctk.CTk):
         r1.pack(fill="x", padx=20, pady=(18, 10))
         self._lbl(r1, "Таблица с данными:").pack(side="left")
         self._tpl_table = tk.StringVar()
+        self._tpl_table.trace_add("write", lambda *_: self._refresh_group_by_cols())
         self._tpl_combo = self._combo(r1, self._tpl_table, width=260)
         self._tpl_combo.pack(side="left", padx=(10, 6))
         self._btn(r1, "Обновить", self._refresh_tpl_tables,
@@ -398,6 +399,43 @@ class App(ctk.CTk):
         self._entry(r2, var=self._filename_col,
                     hint="необязательно", width=200
                     ).pack(side="left", padx=(10, 0))
+
+        r3 = ctk.CTkFrame(c2, fg_color="transparent")
+        r3.pack(fill="x", padx=20, pady=(0, 10))
+        self._lbl(r3, "Группировать по:").pack(side="left")
+        self._group_by_col = tk.StringVar()
+        self._group_by_combo = self._combo(r3, self._group_by_col, width=260)
+        self._group_by_combo.pack(side="left", padx=(10, 6))
+        self._btn(r3, "Обновить", self._refresh_group_by_cols,
+                  primary=False, width=90).pack(side="left")
+
+        r4 = ctk.CTkFrame(c2, fg_color="transparent")
+        r4.pack(fill="x", padx=20, pady=(0, 14))
+        self._lbl(r4, "Формат заголовка группы:").pack(side="left")
+        self._group_label_tpl = tk.StringVar(value="Группа {value}")
+        self._entry(r4, var=self._group_label_tpl,
+                    hint="{value} — значение поля", width=260
+                    ).pack(side="left", padx=(10, 0))
+
+        self._merge_left = tk.BooleanVar(value=True)
+        self._merge_right = tk.BooleanVar(value=False)
+        self._merge_left.trace_add("write", self._on_merge_left_changed)
+        self._merge_right.trace_add("write", self._on_merge_right_changed)
+
+        r_merge = ctk.CTkFrame(c2, fg_color="transparent")
+        r_merge.pack(anchor="w", padx=20, pady=(0, 14))
+        ctk.CTkCheckBox(
+            r_merge, text="Объединять пустые ячейки влево",
+            variable=self._merge_left,
+            corner_radius=4, fg_color=_ACCENT, hover_color=_ACCENT_H,
+            font=ctk.CTkFont(family=_FONT, size=13), text_color=_TEXT1,
+        ).pack(side="left", padx=(0, 24))
+        ctk.CTkCheckBox(
+            r_merge, text="Объединять пустые ячейки вправо",
+            variable=self._merge_right,
+            corner_radius=4, fg_color=_ACCENT, hover_color=_ACCENT_H,
+            font=ctk.CTkFont(family=_FONT, size=13), text_color=_TEXT1,
+        ).pack(side="left")
 
         self._btn_gen = self._btn(c2, "  Сгенерировать документы  ",
                                   self._generate_docs, width=230)
@@ -417,6 +455,30 @@ class App(ctk.CTk):
         # Синхронизируем с вкладкой БД
         if hasattr(self, "_db_combo"):
             self._db_combo.configure(values=tables)
+        self._refresh_group_by_cols()
+
+    def _on_merge_left_changed(self, *_):
+        if self._merge_left.get():
+            self._merge_right.set(False)
+
+    def _on_merge_right_changed(self, *_):
+        if self._merge_right.get():
+            self._merge_left.set(False)
+
+    def _refresh_group_by_cols(self):
+        """Обновляет список колонок для группировки по выбранной таблице."""
+        if not hasattr(self, "_group_by_combo"):
+            return
+        tbl = self._tpl_table.get()
+        cols = [""]  # пустое = без группировки
+        if tbl:
+            try:
+                orig = self.db.get_original_headers(tbl)
+                # Показываем оригинальные (русские) имена столбцов
+                cols.extend(sorted(orig.keys()))
+            except Exception:
+                pass
+        self._group_by_combo.configure(values=cols)
 
     def _download_template(self):
         url = self._doc_url.get().strip()
@@ -472,11 +534,19 @@ class App(ctk.CTk):
         def task():
             try:
                 col = self._filename_col.get().strip() or None
+                group_by = self._group_by_col.get().strip() or None
+                label_tpl = self._group_label_tpl.get().strip() or "{value}"
+                merge_left = self._merge_left.get()
+                merge_right = self._merge_right.get()
                 files = generate_documents_for_all_rows(
                     template_path=tpl_path,
                     table_name=tbl,
                     filename_column=col,
                     db=self.db,
+                    group_by=group_by,
+                    group_label_template=label_tpl,
+                    merge_empty_cells=merge_left or merge_right,
+                    merge_right=merge_right,
                 )
                 self.after(0, lambda: self._gen_ok(files))
             except Exception as e:

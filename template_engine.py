@@ -131,6 +131,165 @@ def _find_loop_row(table) -> Optional[int]:
     return None
 
 
+def _get_cell_grid_span(tc) -> int:
+    """Возвращает gridSpan ячейки (сколько столбцов она занимает)."""
+    tcPr = tc.find(f'{W_NS}tcPr')
+    if tcPr is not None:
+        gridSpan = tcPr.find(f'{W_NS}gridSpan')
+        if gridSpan is not None:
+            val = gridSpan.get(f'{W_NS}val') or gridSpan.get('val')
+            if val:
+                try:
+                    return int(val)
+                except ValueError:
+                    pass
+    return 1
+
+
+def _set_cell_grid_span(tc, span: int) -> None:
+    """Устанавливает gridSpan ячейки."""
+    from docx.oxml import OxmlElement
+    tcPr = tc.find(f'{W_NS}tcPr')
+    if tcPr is None:
+        tcPr = OxmlElement('w:tcPr')
+        tc.insert(0, tcPr)
+    gridSpan = tcPr.find(f'{W_NS}gridSpan')
+    if gridSpan is None:
+        gridSpan = OxmlElement('w:gridSpan')
+        tcPr.append(gridSpan)
+    gridSpan.set(f'{W_NS}val', str(span))
+
+
+def _cell_is_empty(tc) -> bool:
+    """Проверяет, пуста ли ячейка (нет текста после подстановки)."""
+    for t in tc.findall(f'.//{W_NS}t'):
+        if t.text and t.text.strip():
+            return False
+    return True
+
+
+def _merge_empty_cells_left(row_element) -> None:
+    """
+    Объединяет пустые ячейки с левой соседней: если ячейка пуста, её
+    gridSpan добавляется к левой непустой ячейке, а сама пустая удаляется.
+    """
+    tcs = row_element.findall(f'{W_NS}tc')
+    # Идём справа налево, чтобы безопасно удалять элементы
+    i = len(tcs) - 1
+    while i >= 1:
+        tc = tcs[i]
+        if _cell_is_empty(tc):
+            left_tc = tcs[i - 1]
+            left_span = _get_cell_grid_span(left_tc)
+            this_span = _get_cell_grid_span(tc)
+            _set_cell_grid_span(left_tc, left_span + this_span)
+            row_element.remove(tc)
+        i -= 1
+
+
+def _merge_empty_cells_right(row_element) -> None:
+    """
+    Объединяет пустые ячейки с правой соседней: если ячейка пуста, её
+    gridSpan добавляется к правой ячейке, а сама пустая удаляется.
+    """
+    tcs = row_element.findall(f'{W_NS}tc')
+    i = 0
+    while i < len(tcs) - 1:
+        tc = tcs[i]
+        if _cell_is_empty(tc):
+            right_tc = tcs[i + 1]
+            right_span = _get_cell_grid_span(right_tc)
+            this_span = _get_cell_grid_span(tc)
+            _set_cell_grid_span(right_tc, right_span + this_span)
+            row_element.remove(tc)
+            tcs.pop(i)
+            # не инкрементируем i — следующий элемент теперь на той же позиции
+        else:
+            i += 1
+
+
+def _make_group_header_row(template_row_elem, group_label: str, total_cols: int):
+    """
+    Создаёт строку-заголовок группы: копия шаблонной строки с одной объединённой
+    ячейкой, содержащей текст group_label.
+    """
+    row_copy = copy.deepcopy(template_row_elem)
+    tcs = row_copy.findall(f'{W_NS}tc')
+    if not tcs:
+        return row_copy
+
+    # Оставляем первую ячейку, удаляем остальные
+    first_tc = tcs[0]
+    for tc in tcs[1:]:
+        row_copy.remove(tc)
+
+    # Расширяем первую ячейку на все столбцы
+    _set_cell_grid_span(first_tc, total_cols)
+
+    # Заменяем содержимое первой ячейки на group_label
+    _flatten_cell_to_single_paragraph(first_tc)
+    for t in first_tc.findall(f'.//{W_NS}t'):
+        t.text = group_label
+        t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+        break
+    else:
+        # Нет текстового элемента — создаём
+        from docx.oxml import OxmlElement
+        p = first_tc.find(f'{W_NS}p')
+        if p is None:
+            p = OxmlElement('w:p')
+            first_tc.append(p)
+        r = OxmlElement('w:r')
+        t = OxmlElement('w:t')
+        t.text = group_label
+        t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+        r.append(t)
+        p.append(r)
+
+    return row_copy
+
+
+def _get_table_grid_cols(table_elem) -> int:
+    """Возвращает количество столбцов таблицы по <w:tblGrid>."""
+    tblGrid = table_elem.find(f'{W_NS}tblGrid')
+    if tblGrid is not None:
+        return len(tblGrid.findall(f'{W_NS}gridCol'))
+    # Fallback — суммарный gridSpan первой строки
+    first_tr = table_elem.find(f'{W_NS}tr')
+    if first_tr is not None:
+        return sum(_get_cell_grid_span(tc) for tc in first_tr.findall(f'{W_NS}tc'))
+    return 1
+
+
+def _group_students(
+    students_list: list[dict],
+    group_by: Optional[str],
+) -> list[tuple[Optional[str], list[dict]]]:
+    """
+    Группирует студентов по значению поля group_by. Возвращает список пар
+    (значение_группы, список_студентов). Если group_by не задан, возвращается
+    одна пара (None, все_студенты).
+    """
+    if not group_by:
+        return [(None, students_list)]
+
+    groups: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for s in students_list:
+        value = s.get(group_by) or ''
+        # Пробуем санированную версию, если прямого совпадения нет
+        if not value:
+            sanitized = re.sub(r'\s+', '_', group_by.strip()).lower()
+            value = s.get(sanitized) or ''
+        value = value.strip() or '(без группы)'
+        if value not in groups:
+            groups[value] = []
+            order.append(value)
+        groups[value].append(s)
+
+    return [(key, groups[key]) for key in order]
+
+
 def _substitute_student_in_row(row_element, student: dict[str, str]) -> None:
     """
     Подставляет значения студента в строку таблицы:
@@ -179,12 +338,23 @@ def _substitute_student_in_row(row_element, student: dict[str, str]) -> None:
             t.text = text
 
 
-def _expand_table_loops(template_path: Path, students_list: list[dict]) -> None:
+def _expand_table_loops(
+    template_path: Path,
+    students_list: list[dict],
+    group_by: Optional[str] = None,
+    group_label_template: str = "{value}",
+    merge_empty_cells: bool = True,
+    merge_right: bool = False,
+) -> None:
     """
     Разворачивает циклы в таблицах:
     - Находит строку с {% for s in students %}
-    - Дублирует её для каждого студента, подставляя значения
+    - Группирует студентов (если задан group_by) и для каждой группы вставляет
+      объединённую строку-заголовок с названием группы
+    - Дублирует строку шаблона для каждого студента, подставляя значения
     - Удаляет loop markers
+    - Объединяет пустые ячейки с соседней (если merge_empty_cells):
+      merge_right=False — с левой, merge_right=True — с правой
     """
     doc = Document(str(template_path))
 
@@ -198,12 +368,29 @@ def _expand_table_loops(template_path: Path, students_list: list[dict]) -> None:
         parent = tr_element.getparent()
         insert_pos = parent.index(tr_element)
 
-        # Генерируем строки для каждого студента (новые — вставляем ПЕРЕД шаблонной)
+        total_cols = _get_table_grid_cols(table._tbl)
+
+        # Группируем студентов
+        groups = _group_students(students_list, group_by)
+
         new_rows = []
-        for student in students_list:
-            tr_copy = copy.deepcopy(tr_element)
-            _substitute_student_in_row(tr_copy, student)
-            new_rows.append(tr_copy)
+        for group_value, group_students in groups:
+            # Если задана группировка — вставляем строку-заголовок группы
+            if group_value is not None:
+                label = group_label_template.format(value=group_value)
+                header_row = _make_group_header_row(tr_element, label, total_cols)
+                new_rows.append(header_row)
+
+            # Строки для студентов группы
+            for student in group_students:
+                tr_copy = copy.deepcopy(tr_element)
+                _substitute_student_in_row(tr_copy, student)
+                if merge_empty_cells:
+                    if merge_right:
+                        _merge_empty_cells_right(tr_copy)
+                    else:
+                        _merge_empty_cells_left(tr_copy)
+                new_rows.append(tr_copy)
 
         # Вставляем новые строки перед шаблонной строкой
         for i, new_row in enumerate(new_rows):
@@ -221,8 +408,19 @@ def generate_document(
     output_filename: str,
     all_rows_data: Optional[tuple[list[str], list[list]]] = None,
     original_headers_map: Optional[dict[str, str]] = None,
+    group_by: Optional[str] = None,
+    group_label_template: str = "{value}",
+    merge_empty_cells: bool = True,
+    merge_right: bool = False,
 ) -> Path:
-    """Генерирует один документ из шаблона."""
+    """
+    Генерирует один документ из шаблона.
+
+    group_by: имя колонки для группировки студентов в таблице (например, "группы №").
+    group_label_template: формат строки-заголовка группы, где {value} — значение поля.
+    merge_empty_cells: объединять пустые ячейки с соседней.
+    merge_right: True — объединять с правой, False — с левой.
+    """
     # Текущий студент (для прямых плейсхолдеров вне таблиц)
     current_student = _build_student_dict(row_data, original_headers_map)
 
@@ -248,8 +446,15 @@ def generate_document(
         work_template = Path(tmpdir) / template_path.name
         shutil.copy2(template_path, work_template)
 
-        # Шаг 1: разворачиваем циклы в таблицах вручную (с прямой подстановкой)
-        _expand_table_loops(work_template, students_list)
+        # Шаг 1: разворачиваем циклы в таблицах (с группировкой и подстановкой)
+        _expand_table_loops(
+            work_template,
+            students_list,
+            group_by=group_by,
+            group_label_template=group_label_template,
+            merge_empty_cells=merge_empty_cells,
+            merge_right=merge_right,
+        )
 
         # Шаг 2: рендерим оставшиеся плейсхолдеры через docxtpl (нетабличные)
         context: dict = {**current_student}
@@ -268,8 +473,16 @@ def generate_documents_for_all_rows(
     table_name: str,
     filename_column: Optional[str] = None,
     db: Optional[Database] = None,
+    group_by: Optional[str] = None,
+    group_label_template: str = "{value}",
+    merge_empty_cells: bool = True,
+    merge_right: bool = False,
 ) -> list[Path]:
-    """Генерирует по одному документу на каждую строку данных в таблице."""
+    """
+    Генерирует по одному документу на каждую строку данных в таблице.
+
+    group_by: имя колонки для группировки студентов внутри таблицы документа.
+    """
     close_db = db is None
     if db is None:
         db = Database()
@@ -297,6 +510,10 @@ def generate_documents_for_all_rows(
                 output_filename=output_name,
                 all_rows_data=all_rows_data,
                 original_headers_map=original_map,
+                group_by=group_by,
+                group_label_template=group_label_template,
+                merge_empty_cells=merge_empty_cells,
+                merge_right=merge_right,
             )
             generated.append(path)
 
