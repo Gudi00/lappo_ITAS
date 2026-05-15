@@ -105,6 +105,23 @@ class Database:
             )
         """)
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS column_aliases (
+                table_name TEXT NOT NULL,
+                safe_col_name TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                PRIMARY KEY (table_name, safe_col_name)
+            )
+        """)
+
+        # Migration: add display_name to sheets_registry if not present
+        cursor.execute("PRAGMA table_info(sheets_registry)")
+        existing_cols = {row[1] for row in cursor.fetchall()}
+        if "display_name" not in existing_cols:
+            cursor.execute(
+                "ALTER TABLE sheets_registry ADD COLUMN display_name TEXT"
+            )
+
         self.connection.commit()
 
     # === Работа с данными из Google Sheets ===
@@ -359,6 +376,122 @@ class Database:
             ORDER BY name
         """)
         return [row["name"] for row in cursor.fetchall()]
+
+    def set_table_display_name(self, table_name: str, display_name: str) -> None:
+        """Устанавливает отображаемое имя таблицы (сохраняется при повторной загрузке)."""
+        self.connection.execute(
+            "UPDATE sheets_registry SET display_name = ? WHERE table_name = ?",
+            (display_name.strip() or None, table_name),
+        )
+        self.connection.commit()
+
+    def get_tables_with_display_names(self) -> list[tuple[str, str]]:
+        """
+        Возвращает [(internal_name, display_name), ...].
+        display_name: пользовательское имя → sheet_name из Google → internal_name.
+        """
+        cursor = self.connection.execute("""
+            SELECT m.name AS tname,
+                   COALESCE(
+                       NULLIF(TRIM(COALESCE(s.display_name, '')), ''),
+                       NULLIF(TRIM(COALESCE(s.sheet_name,   '')), ''),
+                       m.name
+                   ) AS dname
+            FROM sqlite_master m
+            LEFT JOIN sheets_registry s ON s.table_name = m.name
+            WHERE m.type = 'table' AND m.name LIKE 'sheet_%'
+            ORDER BY m.name
+        """)
+        return [(row["tname"], row["dname"]) for row in cursor.fetchall()]
+
+    def set_column_alias(self, table_name: str, safe_col: str, alias: str) -> None:
+        """Устанавливает или удаляет локальное имя столбца."""
+        alias = alias.strip()
+        if alias:
+            self.connection.execute("""
+                INSERT INTO column_aliases (table_name, safe_col_name, alias)
+                VALUES (?, ?, ?)
+                ON CONFLICT(table_name, safe_col_name) DO UPDATE SET alias = excluded.alias
+            """, (table_name, safe_col, alias))
+        else:
+            self.connection.execute(
+                "DELETE FROM column_aliases WHERE table_name = ? AND safe_col_name = ?",
+                (table_name, safe_col)
+            )
+        self.connection.commit()
+
+    def get_column_aliases(self, table_name: str) -> dict[str, str]:
+        """Возвращает маппинг safe_col_name -> alias."""
+        cursor = self.connection.execute(
+            "SELECT safe_col_name, alias FROM column_aliases WHERE table_name = ?",
+            (table_name,)
+        )
+        return {row["safe_col_name"]: row["alias"] for row in cursor.fetchall()}
+
+    def merge_columns(self, table_name: str, col_a: str, col_b: str) -> None:
+        """
+        Объединяет col_b в col_a (через пробел если оба непустые), затем удаляет col_b.
+        """
+        import sqlite3 as _sqlite3
+        self.connection.execute(f"""
+            UPDATE [{table_name}]
+            SET [{col_a}] = CASE
+                WHEN TRIM(COALESCE([{col_a}], '')) != '' AND TRIM(COALESCE([{col_b}], '')) != ''
+                    THEN TRIM([{col_a}]) || ' ' || TRIM([{col_b}])
+                WHEN TRIM(COALESCE([{col_a}], '')) != ''
+                    THEN TRIM([{col_a}])
+                ELSE TRIM(COALESCE([{col_b}], ''))
+            END
+        """)
+        self.connection.commit()
+
+        if _sqlite3.sqlite_version_info >= (3, 35, 0):
+            self.connection.execute(f"ALTER TABLE [{table_name}] DROP COLUMN [{col_b}]")
+            self.connection.commit()
+        else:
+            self._drop_column_fallback(table_name, col_b)
+
+        cursor = self.connection.execute(
+            "SELECT columns_json FROM sheets_registry WHERE table_name = ?",
+            (table_name,)
+        )
+        row = cursor.fetchone()
+        if row and row["columns_json"]:
+            col_map = json.loads(row["columns_json"])
+            new_map = {k: v for k, v in col_map.items() if v != col_b}
+            self.connection.execute(
+                "UPDATE sheets_registry SET columns_json = ? WHERE table_name = ?",
+                (json.dumps(new_map, ensure_ascii=False), table_name)
+            )
+
+        self.connection.execute(
+            "DELETE FROM column_aliases WHERE table_name = ? AND safe_col_name = ?",
+            (table_name, col_b)
+        )
+        self.connection.commit()
+
+    def _drop_column_fallback(self, table_name: str, col_to_drop: str) -> None:
+        """Пересоздаёт таблицу без указанного столбца (для SQLite < 3.35)."""
+        cursor = self.connection.execute(f"PRAGMA table_info([{table_name}])")
+        all_cols = [r["name"] for r in cursor.fetchall()]
+        keep_cols = [c for c in all_cols if c != col_to_drop]
+
+        col_defs = []
+        for c in keep_cols:
+            if c == "id":
+                col_defs.append("id INTEGER PRIMARY KEY AUTOINCREMENT")
+            else:
+                col_defs.append(f"[{c}] TEXT")
+
+        tmp = f"{table_name}_tmp"
+        cols_sel = ", ".join(f"[{c}]" for c in keep_cols)
+
+        self.connection.execute(f"DROP TABLE IF EXISTS [{tmp}]")
+        self.connection.execute(f"CREATE TABLE [{tmp}] ({', '.join(col_defs)})")
+        self.connection.execute(f"INSERT INTO [{tmp}] ({cols_sel}) SELECT {cols_sel} FROM [{table_name}]")
+        self.connection.execute(f"DROP TABLE [{table_name}]")
+        self.connection.execute(f"ALTER TABLE [{tmp}] RENAME TO [{table_name}]")
+        self.connection.commit()
 
     def close(self):
         """Закрывает соединение с базой данных."""

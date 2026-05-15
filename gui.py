@@ -3,8 +3,10 @@
 Использует CustomTkinter для современного внешнего вида.
 """
 
+import re
 import threading
 import tkinter as tk
+from datetime import datetime
 from tkinter import messagebox, filedialog
 from tkinter import ttk as tkttk
 from pathlib import Path
@@ -15,7 +17,7 @@ import config
 from database import Database
 from google_sheets import sync_sheet_to_database, extract_sheet_id
 from google_docs import download_template, extract_doc_id
-from template_engine import find_placeholders, generate_documents_for_all_rows
+from template_engine import find_placeholders, generate_documents_for_all_rows, generate_document
 from email_sender import EmailSender
 
 # ── Тема ──────────────────────────────────────────────────────────────────────
@@ -63,6 +65,476 @@ class _NavButton(ctk.CTkButton):
 
     def deactivate(self):
         self.configure(fg_color="transparent", text_color=_TEXT1, hover_color="#EBEBF0")
+
+
+class _TablePickerWidget(ctk.CTkFrame):
+    """
+    Compact table-selector: clickable rows with hover-preview popup.
+    The preview appears after a short delay and shows the first rows of data.
+    selected_var always holds the *internal* SQLite table name.
+    """
+    _DELAY_MS = 380
+
+    def __init__(self, parent, db, selected_var: tk.StringVar, **kw):
+        super().__init__(
+            parent, fg_color="white", corner_radius=8,
+            border_width=1, border_color=_BORDER, **kw,
+        )
+        self._db = db
+        self._sel = selected_var
+        self._tables: list[tuple[str, str]] = []
+        self._popup = None
+        self._after_id = None      # timer: show popup
+        self._hide_after_id = None # timer: hide popup
+
+        self._inner = tk.Frame(self, bg="white")
+        self._inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+    # ── public ────────────────────────────────────────────────────────────────
+
+    def refresh(self, tables: list[tuple[str, str]]) -> None:
+        """Re-populate list with [(internal_name, display_name), ...]."""
+        self._tables = tables
+        internals = [t[0] for t in tables]
+        if self._sel.get() not in internals and internals:
+            self._sel.set(internals[0])
+        self._rebuild()
+
+    # ── internal ──────────────────────────────────────────────────────────────
+
+    def _rebuild(self) -> None:
+        for w in self._inner.winfo_children():
+            w.destroy()
+        if not self._tables:
+            tk.Label(
+                self._inner, text="Нет загруженных таблиц",
+                bg="white", fg=_TEXT2, font=(_FONT, 12), pady=10,
+            ).pack()
+            return
+        sel = self._sel.get()
+        for i, (internal, display) in enumerate(self._tables):
+            is_sel = internal == sel
+            is_last = i == len(self._tables) - 1
+            self._add_row(internal, display, is_sel, is_last)
+
+    def _add_row(self, internal: str, display: str, selected: bool, last: bool) -> None:
+        bg    = _ACCENT if selected else "white"
+        fg1   = "white" if selected else _TEXT1
+        fg2   = "white" if selected else _TEXT2
+
+        row = tk.Frame(self._inner, bg=bg, cursor="hand2")
+        row.pack(fill="x")
+
+        tk.Label(row, text="⊞", bg=bg, fg=fg1,
+                 font=(_FONT, 12), padx=10, pady=8).pack(side="left")
+        tk.Label(row, text=display, bg=bg, fg=fg1,
+                 font=(_FONT, 13), anchor="w", pady=8).pack(
+                     side="left", fill="x", expand=True)
+        try:
+            cnt = self._db.get_row_count(internal)
+            detail = f"{cnt} стр."
+        except Exception:
+            detail = ""
+        tk.Label(row, text=detail, bg=bg, fg=fg2,
+                 font=(_FONT, 11), padx=12, pady=8).pack(side="right")
+
+        if not last:
+            tk.Frame(self._inner, bg=_BORDER, height=1).pack(fill="x")
+
+        for w in (*row.winfo_children(), row):
+            w.bind("<Button-1>", lambda e, n=internal: self._on_click(n))
+            w.bind("<Enter>",    lambda e, n=internal, r=row, s=selected:
+                                 self._on_enter(e, n, r, s))
+            w.bind("<Leave>",    lambda e, r=row, s=selected:
+                                 self._on_leave(r, s))
+
+    def _on_click(self, internal: str) -> None:
+        self._hide_popup()
+        self._sel.set(internal)
+        self._rebuild()
+
+    def _on_enter(self, event, internal: str, row: tk.Frame, is_sel: bool) -> None:
+        if not is_sel:
+            self._tint(row, "#EBF4FF", _TEXT1, _TEXT2)
+        if self._after_id:
+            self.after_cancel(self._after_id)
+        self._after_id = self.after(
+            self._DELAY_MS,
+            lambda: self._show_popup(internal, event.x_root, event.y_root),
+        )
+
+    def _on_leave(self, row: tk.Frame, is_sel: bool) -> None:
+        if not is_sel:
+            self._tint(row, "white", _TEXT1, _TEXT2)
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        if self._hide_after_id:
+            self.after_cancel(self._hide_after_id)
+        self._hide_after_id = self.after(600, self._maybe_hide)
+
+    def _tint(self, row: tk.Frame, bg: str, fg: str, fg2: str) -> None:
+        try:
+            row.configure(bg=bg)
+            ch = row.winfo_children()
+            for i, w in enumerate(ch):
+                w.configure(bg=bg, fg=(fg2 if i == len(ch) - 1 else fg))
+        except Exception:
+            pass
+
+    def _cancel_hide(self) -> None:
+        """Cancel a pending hide timer (called when cursor enters the popup)."""
+        if self._hide_after_id:
+            self.after_cancel(self._hide_after_id)
+            self._hide_after_id = None
+
+    def _maybe_hide(self) -> None:
+        self._hide_after_id = None
+        if self._popup is None:
+            return
+        try:
+            if not self._popup.winfo_exists():
+                self._popup = None
+                return
+            px, py = self._popup.winfo_rootx(), self._popup.winfo_rooty()
+            pw = max(self._popup.winfo_width(), self._popup.winfo_reqwidth())
+            ph = max(self._popup.winfo_height(), self._popup.winfo_reqheight())
+            mx = self._popup.winfo_pointerx()
+            my = self._popup.winfo_pointery()
+            if px <= mx <= px + pw and py <= my <= py + ph:
+                return
+        except Exception:
+            pass
+        self._hide_popup()
+
+    def _hide_popup(self) -> None:
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        if self._hide_after_id:
+            self.after_cancel(self._hide_after_id)
+            self._hide_after_id = None
+        if self._popup is not None:
+            try:
+                if self._popup.winfo_exists():
+                    self._popup.destroy()
+            except Exception:
+                pass
+        self._popup = None
+
+    def _show_popup(self, internal: str, rx: int, ry: int) -> None:
+        self._hide_popup()
+        try:
+            headers, rows = self._db.get_all_data(internal)
+            orig    = self._db.get_original_headers(internal)
+            aliases = self._db.get_column_aliases(internal)
+            rev     = {v: k for k, v in orig.items()}
+        except Exception:
+            return
+        if not headers:
+            return
+
+        cols      = headers[:5]
+        prev_rows = rows[:6]
+
+        popup = tk.Toplevel()
+        popup.overrideredirect(True)
+
+        outer = tk.Frame(popup, bg=_BORDER, padx=1, pady=1)
+        outer.pack(fill="both", expand=True)
+        inner = tk.Frame(outer, bg="white")
+        inner.pack(fill="both", expand=True)
+
+        # Header strip
+        try:
+            all_tbls  = self._db.get_tables_with_display_names()
+            disp_name = next((d for t, d in all_tbls if t == internal), internal)
+        except Exception:
+            disp_name = internal
+        try:
+            total = self._db.get_row_count(internal)
+        except Exception:
+            total = len(rows)
+
+        hdr = tk.Frame(inner, bg=_BG)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text=f"  {disp_name}", bg=_BG, fg=_TEXT1,
+                 font=(_FONT, 12, "bold"), anchor="w", pady=7).pack(side="left")
+        tk.Label(hdr, text=f"{total} строк  ", bg=_BG, fg=_TEXT2,
+                 font=(_FONT, 11), anchor="e", pady=7).pack(side="right")
+        tk.Frame(inner, bg=_BORDER, height=1).pack(fill="x")
+
+        # Mini Treeview
+        _SN = "PopPrev.Treeview"
+        sty = tkttk.Style()
+        sty.configure(_SN, rowheight=22, font=(_FONT, 11),
+                      background="white", fieldbackground="white",
+                      foreground=_TEXT1, borderwidth=0)
+        sty.configure(f"{_SN}.Heading", font=(_FONT, 10, "bold"),
+                      background=_BG, foreground=_TEXT2, relief="flat")
+        sty.map(_SN,
+                background=[("selected", "#E3EEFB")],
+                foreground=[("selected", _TEXT1)])
+
+        col_widths = []
+        for col in cols:
+            disp = aliases.get(col) or rev.get(col, col)
+            max_vl = max(
+                (len(str(r[headers.index(col)])) for r in prev_rows
+                 if headers.index(col) < len(r)),
+                default=0,
+            )
+            col_widths.append(min(max(len(disp) * 8 + 20, max_vl * 7 + 10, 70), 160))
+
+        tree = tkttk.Treeview(inner, columns=cols, show="headings",
+                               style=_SN, height=min(len(prev_rows), 6))
+        for col, w in zip(cols, col_widths):
+            disp = aliases.get(col) or rev.get(col, col)
+            tree.heading(col, text=disp)
+            tree.column(col, width=w, minwidth=40, stretch=False)
+
+        for row_data in prev_rows:
+            vals = [
+                str(row_data[headers.index(c)])[:28] if c in headers else ""
+                for c in cols
+            ]
+            tree.insert("", "end", values=vals)
+        tree.pack(padx=4, pady=4)
+
+        if len(rows) > 6:
+            more = total - 6 if isinstance(total, int) else "…"
+            tk.Label(inner, text=f"  … ещё {more} строк",
+                     bg="white", fg=_TEXT2, font=(_FONT, 10),
+                     anchor="w", pady=4).pack(fill="x", padx=8)
+
+        popup.update_idletasks()
+        pw  = popup.winfo_reqwidth()
+        ph  = popup.winfo_reqheight()
+        sw  = popup.winfo_screenwidth()
+        sh  = popup.winfo_screenheight()
+        px  = rx + 16
+        py  = ry - 30
+        if px + pw > sw - 10:
+            px = rx - pw - 16
+        if py + ph > sh - 10:
+            py = sh - ph - 10
+        popup.geometry(f"+{max(0, px)}+{max(0, py)}")
+        self._popup = popup
+        popup.bind("<Enter>", lambda e: self._cancel_hide())
+        popup.bind("<Leave>", lambda e: self.after(300, self._maybe_hide))
+
+
+class _ColumnRenameDialog(ctk.CTkToplevel):
+    """Диалог массового переименования столбцов."""
+
+    def __init__(self, parent, db, table_name: str, on_save):
+        super().__init__(parent)
+        self.title("Переименование столбцов")
+        self.geometry("580x500")
+        self.resizable(False, True)
+        self.configure(fg_color=_BG)
+        self.after(150, lambda: self.grab_set() if self.winfo_exists() else None)
+
+        self._db = db
+        self._table_name = table_name
+        self._on_save = on_save
+        self._entries: list[tuple[str, tk.StringVar]] = []
+        self._build()
+
+    def _build(self):
+        ctk.CTkLabel(
+            self, text="Переименование столбцов",
+            font=ctk.CTkFont(family=_FONT, size=18, weight="bold"),
+            text_color=_TEXT1,
+        ).pack(anchor="w", padx=24, pady=(20, 2))
+        ctk.CTkLabel(
+            self,
+            text="Локальные имена сохраняются при повторной загрузке таблицы.",
+            font=ctk.CTkFont(family=_FONT, size=12),
+            text_color=_TEXT2,
+        ).pack(anchor="w", padx=24, pady=(0, 10))
+
+        hdr = ctk.CTkFrame(self, fg_color="transparent")
+        hdr.pack(fill="x", padx=24)
+        ctk.CTkLabel(hdr, text="Исходное имя (Google Sheets)", width=240, anchor="w",
+                     font=ctk.CTkFont(family=_FONT, size=12, weight="bold"),
+                     text_color=_TEXT2).pack(side="left")
+        ctk.CTkLabel(hdr, text="Локальное имя", anchor="w",
+                     font=ctk.CTkFont(family=_FONT, size=12, weight="bold"),
+                     text_color=_TEXT2).pack(side="left", padx=(8, 0))
+        ctk.CTkFrame(self, height=1, fg_color=_BORDER).pack(fill="x", padx=24, pady=(6, 0))
+
+        scroll = ctk.CTkScrollableFrame(
+            self, fg_color="white", corner_radius=8,
+            border_width=1, border_color=_BORDER,
+        )
+        scroll.pack(fill="both", expand=True, padx=24, pady=(4, 12))
+
+        try:
+            headers, _ = self._db.get_all_data(self._table_name)
+            orig = self._db.get_original_headers(self._table_name)
+            aliases = self._db.get_column_aliases(self._table_name)
+            rev = {v: k for k, v in orig.items()}
+        except Exception:
+            headers, rev, aliases = [], {}, {}
+
+        for safe_col in headers:
+            orig_name = rev.get(safe_col, safe_col)
+            var = tk.StringVar(value=aliases.get(safe_col, ""))
+            self._entries.append((safe_col, var))
+
+            row = ctk.CTkFrame(scroll, fg_color="transparent")
+            row.pack(fill="x", pady=4, padx=8)
+            ctk.CTkLabel(
+                row, text=orig_name, width=240, anchor="w",
+                font=ctk.CTkFont(family=_FONT, size=13),
+                text_color=_TEXT1,
+            ).pack(side="left")
+            ctk.CTkEntry(
+                row, textvariable=var, width=250,
+                corner_radius=6, border_width=1, border_color=_BORDER,
+                fg_color="white", text_color=_TEXT1,
+                placeholder_text=orig_name,
+                font=ctk.CTkFont(family=_FONT, size=13),
+            ).pack(side="left", padx=(8, 0))
+
+        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row.pack(fill="x", padx=24, pady=(0, 20))
+        ctk.CTkButton(
+            btn_row, text="Отмена", command=self.destroy,
+            corner_radius=8, height=36, width=100,
+            fg_color="#E8E8ED", hover_color="#D8D8DD", text_color=_TEXT1,
+            font=ctk.CTkFont(family=_FONT, size=13, weight="bold"),
+        ).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(
+            btn_row, text="Сохранить", command=self._save,
+            corner_radius=8, height=36, width=110,
+            fg_color=_ACCENT, hover_color=_ACCENT_H, text_color="white",
+            font=ctk.CTkFont(family=_FONT, size=13, weight="bold"),
+        ).pack(side="right")
+
+    def _save(self):
+        for safe_col, var in self._entries:
+            self._db.set_column_alias(self._table_name, safe_col, var.get())
+        self.destroy()
+        if self._on_save:
+            self._on_save()
+
+
+class _MergeColumnsDialog(ctk.CTkToplevel):
+    """Диалог объединения двух столбцов."""
+
+    def __init__(self, parent, db, table_name: str, on_merge):
+        super().__init__(parent)
+        self.title("Объединение столбцов")
+        self.geometry("480x360")
+        self.resizable(False, False)
+        self.configure(fg_color=_BG)
+        self.after(150, lambda: self.grab_set() if self.winfo_exists() else None)
+
+        self._db = db
+        self._table_name = table_name
+        self._on_merge = on_merge
+        self._col_map: dict[str, str] = {}
+        self._build()
+
+    def _build(self):
+        ctk.CTkLabel(
+            self, text="Объединение столбцов",
+            font=ctk.CTkFont(family=_FONT, size=18, weight="bold"),
+            text_color=_TEXT1,
+        ).pack(anchor="w", padx=24, pady=(20, 2))
+        ctk.CTkLabel(
+            self,
+            text="Оба непустых — объединяются через пробел.\nОдин пустой — берётся значение из другого.",
+            font=ctk.CTkFont(family=_FONT, size=12),
+            text_color=_TEXT2, justify="left",
+        ).pack(anchor="w", padx=24, pady=(0, 16))
+
+        try:
+            headers, _ = self._db.get_all_data(self._table_name)
+            orig = self._db.get_original_headers(self._table_name)
+            aliases = self._db.get_column_aliases(self._table_name)
+            rev = {v: k for k, v in orig.items()}
+        except Exception:
+            headers, rev, aliases = [], {}, {}
+
+        display_names = []
+        for safe in headers:
+            disp = aliases.get(safe) or rev.get(safe, safe)
+            display_names.append(disp)
+            self._col_map[disp] = safe
+
+        r1 = ctk.CTkFrame(self, fg_color="transparent")
+        r1.pack(fill="x", padx=24, pady=(0, 10))
+        ctk.CTkLabel(r1, text="Первый столбец:", width=160, anchor="w",
+                     font=ctk.CTkFont(family=_FONT, size=13), text_color=_TEXT1).pack(side="left")
+        self._col_a_var = tk.StringVar(value=display_names[0] if display_names else "")
+        ctk.CTkComboBox(
+            r1, variable=self._col_a_var, values=display_names, state="readonly", width=250,
+            corner_radius=8, border_color=_BORDER, fg_color="white",
+            button_color=_BORDER, button_hover_color=_TEXT2,
+            font=ctk.CTkFont(family=_FONT, size=13),
+            dropdown_font=ctk.CTkFont(family=_FONT, size=13),
+        ).pack(side="left")
+
+        r2 = ctk.CTkFrame(self, fg_color="transparent")
+        r2.pack(fill="x", padx=24, pady=(0, 16))
+        ctk.CTkLabel(r2, text="Второй столбец:", width=160, anchor="w",
+                     font=ctk.CTkFont(family=_FONT, size=13), text_color=_TEXT1).pack(side="left")
+        self._col_b_var = tk.StringVar(value=display_names[1] if len(display_names) > 1 else "")
+        ctk.CTkComboBox(
+            r2, variable=self._col_b_var, values=display_names, state="readonly", width=250,
+            corner_radius=8, border_color=_BORDER, fg_color="white",
+            button_color=_BORDER, button_hover_color=_TEXT2,
+            font=ctk.CTkFont(family=_FONT, size=13),
+            dropdown_font=ctk.CTkFont(family=_FONT, size=13),
+        ).pack(side="left")
+
+        warn = ctk.CTkFrame(self, fg_color="#FFF8E1", corner_radius=8,
+                            border_width=1, border_color="#FFD54F")
+        warn.pack(fill="x", padx=24, pady=(0, 20))
+        ctk.CTkLabel(
+            warn,
+            text="⚠  Результат записывается в первый столбец.\n"
+                 "   Второй столбец будет удалён из таблицы.",
+            font=ctk.CTkFont(family=_FONT, size=12),
+            text_color="#5D4037", justify="left", anchor="w",
+        ).pack(padx=12, pady=10, anchor="w")
+
+        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row.pack(fill="x", padx=24, pady=(0, 20))
+        ctk.CTkButton(
+            btn_row, text="Отмена", command=self.destroy,
+            corner_radius=8, height=36, width=100,
+            fg_color="#E8E8ED", hover_color="#D8D8DD", text_color=_TEXT1,
+            font=ctk.CTkFont(family=_FONT, size=13, weight="bold"),
+        ).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(
+            btn_row, text="Объединить", command=self._merge,
+            corner_radius=8, height=36, width=120,
+            fg_color=_ACCENT, hover_color=_ACCENT_H, text_color="white",
+            font=ctk.CTkFont(family=_FONT, size=13, weight="bold"),
+        ).pack(side="right")
+
+    def _merge(self):
+        disp_a = self._col_a_var.get()
+        disp_b = self._col_b_var.get()
+        if not disp_a or not disp_b:
+            messagebox.showwarning("Внимание", "Выберите оба столбца.", parent=self)
+            return
+        if disp_a == disp_b:
+            messagebox.showwarning("Внимание", "Выберите разные столбцы.", parent=self)
+            return
+        col_a = self._col_map.get(disp_a, disp_a)
+        col_b = self._col_map.get(disp_b, disp_b)
+        try:
+            self._db.merge_columns(self._table_name, col_a, col_b)
+            self.destroy()
+            if self._on_merge:
+                self._on_merge()
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось объединить:\n{e}", parent=self)
 
 
 # ── Главное окно ──────────────────────────────────────────────────────────────
@@ -382,15 +854,15 @@ class App(ctk.CTk):
         c2 = self._card(f)
         c2.pack(fill="x", padx=32, pady=(0, 16))
 
-        r1 = ctk.CTkFrame(c2, fg_color="transparent")
-        r1.pack(fill="x", padx=20, pady=(18, 10))
-        self._lbl(r1, "Таблица с данными:").pack(side="left")
+        self._lbl(c2, "Таблица с данными:").pack(anchor="w", padx=20, pady=(18, 4))
         self._tpl_table = tk.StringVar()
         self._tpl_table.trace_add("write", lambda *_: self._refresh_group_by_cols())
-        self._tpl_combo = self._combo(r1, self._tpl_table, width=260)
-        self._tpl_combo.pack(side="left", padx=(10, 6))
-        self._btn(r1, "Обновить", self._refresh_tpl_tables,
-                  primary=False, width=90).pack(side="left")
+        self._tbl_picker = _TablePickerWidget(c2, self.db, self._tpl_table)
+        self._tbl_picker.pack(fill="x", padx=20, pady=(0, 6))
+        r1_btn = ctk.CTkFrame(c2, fg_color="transparent")
+        r1_btn.pack(fill="x", padx=20, pady=(0, 10))
+        self._btn(r1_btn, "Обновить таблицы", self._refresh_tpl_tables,
+                  primary=False, width=140).pack(side="left")
 
         r2 = ctk.CTkFrame(c2, fg_color="transparent")
         r2.pack(fill="x", padx=20, pady=(0, 10))
@@ -409,6 +881,21 @@ class App(ctk.CTk):
         self._lbl(r_num, " }}").pack(side="left")
         self._lbl(r_num, "   ← оставьте пустым чтобы не нумеровать",
                   secondary=True).pack(side="left", padx=(8, 0))
+
+        # ── Режим единого документа ──
+        r_single = ctk.CTkFrame(c2, fg_color="transparent")
+        r_single.pack(fill="x", padx=20, pady=(0, 10))
+        self._single_doc = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            r_single, text="Создать один документ для всех строк",
+            variable=self._single_doc,
+            corner_radius=4, fg_color=_ACCENT, hover_color=_ACCENT_H,
+            font=ctk.CTkFont(family=_FONT, size=13), text_color=_TEXT1,
+        ).pack(side="left", padx=(0, 16))
+        self._lbl(r_single, "Имя файла:").pack(side="left")
+        self._single_doc_name = tk.StringVar(value="document.docx")
+        self._entry(r_single, var=self._single_doc_name, width=180
+                    ).pack(side="left", padx=(6, 0))
 
         # ── Многоуровневая группировка ──
         self._lbl(c2, "Уровни группировки:").pack(
@@ -453,6 +940,35 @@ class App(ctk.CTk):
             font=ctk.CTkFont(family=_FONT, size=13), text_color=_TEXT1,
         ).pack(side="left")
 
+        # ── Правила слияния по столбцам ──
+        self._lbl(c2, "Правила слияния столбцов:").pack(
+            anchor="w", padx=20, pady=(0, 4))
+
+        self._col_merge_rules: list[tuple[str, tk.StringVar]] = []
+
+        self._col_merge_frame = ctk.CTkFrame(
+            c2, fg_color="#F5F5F7", corner_radius=8,
+            border_width=1, border_color=_BORDER)
+        self._col_merge_frame.pack(fill="x", padx=20, pady=(0, 6))
+        self._rebuild_col_merge_ui()
+
+        r_col_add = ctk.CTkFrame(c2, fg_color="transparent")
+        r_col_add.pack(fill="x", padx=20, pady=(0, 14))
+        self._add_cmr_col = tk.StringVar()
+        self._add_cmr_combo = self._combo(r_col_add, self._add_cmr_col, width=200)
+        self._add_cmr_combo.pack(side="left", padx=(0, 6))
+        self._add_cmr_dir = tk.StringVar(value="влево")
+        ctk.CTkComboBox(
+            r_col_add, variable=self._add_cmr_dir,
+            values=["влево", "вправо"], state="readonly", width=100,
+            corner_radius=8, border_color=_BORDER, fg_color="white",
+            button_color=_BORDER, button_hover_color=_TEXT2,
+            font=ctk.CTkFont(family=_FONT, size=13),
+            dropdown_font=ctk.CTkFont(family=_FONT, size=13),
+        ).pack(side="left", padx=(0, 6))
+        self._btn(r_col_add, "+ Добавить", self._add_col_merge_rule,
+                  primary=False, width=110).pack(side="left")
+
         self._btn_gen = self._btn(c2, "  Сгенерировать документы  ",
                                   self._generate_docs, width=230)
         self._btn_gen.pack(anchor="w", padx=20, pady=(4, 20))
@@ -464,13 +980,14 @@ class App(ctk.CTk):
         self._refresh_tpl_tables()
 
     def _refresh_tpl_tables(self):
-        tables = self.db.get_table_names()
-        self._tpl_combo.configure(values=tables)
-        if tables and not self._tpl_table.get():
-            self._tpl_table.set(tables[0])
-        # Синхронизируем с вкладкой БД
+        tables_info = self.db.get_tables_with_display_names()
+        internals = [t[0] for t in tables_info]
+        if hasattr(self, "_tbl_picker"):
+            self._tbl_picker.refresh(tables_info)
+        if internals and self._tpl_table.get() not in internals:
+            self._tpl_table.set(internals[0])
         if hasattr(self, "_db_combo"):
-            self._db_combo.configure(values=tables)
+            self._refresh_db()
         self._refresh_group_by_cols()
 
     def _on_merge_left_changed(self, *_):
@@ -493,6 +1010,8 @@ class App(ctk.CTk):
                 pass
         if hasattr(self, "_add_group_combo"):
             self._add_group_combo.configure(values=cols)
+        if hasattr(self, "_add_cmr_combo"):
+            self._add_cmr_combo.configure(values=cols)
 
     def _add_group_level(self):
         """Добавляет выбранную колонку в список уровней группировки."""
@@ -541,6 +1060,53 @@ class App(ctk.CTk):
             self._btn(row, "×",
                       lambda idx=i: self._remove_group_level(idx),
                       primary=False, width=32).pack(side="left")
+
+    def _rebuild_col_merge_ui(self):
+        for w in self._col_merge_frame.winfo_children():
+            w.destroy()
+        if not self._col_merge_rules:
+            self._lbl(self._col_merge_frame,
+                      "Нет правил — используются глобальные настройки слияния",
+                      secondary=True).pack(padx=12, pady=8)
+            return
+        for i, (col, dir_var) in enumerate(self._col_merge_rules):
+            row = ctk.CTkFrame(self._col_merge_frame, fg_color="transparent")
+            row.pack(fill="x", padx=8, pady=4)
+            ctk.CTkLabel(
+                row, text=f"{i + 1}.", width=22, anchor="e",
+                font=ctk.CTkFont(family=_FONT, size=12), text_color=_TEXT2,
+            ).pack(side="left")
+            ctk.CTkLabel(
+                row, text=col, width=150, anchor="w",
+                font=ctk.CTkFont(family=_FONT, size=13, weight="bold"),
+                text_color=_TEXT1,
+            ).pack(side="left", padx=(4, 8))
+            ctk.CTkComboBox(
+                row, variable=dir_var, values=["влево", "вправо"],
+                state="readonly", width=100,
+                corner_radius=8, border_color=_BORDER, fg_color="white",
+                button_color=_BORDER, button_hover_color=_TEXT2,
+                font=ctk.CTkFont(family=_FONT, size=13),
+                dropdown_font=ctk.CTkFont(family=_FONT, size=13),
+            ).pack(side="left", padx=(0, 6))
+            self._btn(row, "×",
+                      lambda idx=i: self._remove_col_merge_rule(idx),
+                      primary=False, width=32).pack(side="left")
+
+    def _add_col_merge_rule(self):
+        col = self._add_cmr_col.get().strip()
+        if not col:
+            return
+        if any(c == col for c, _ in self._col_merge_rules):
+            return
+        dir_var = tk.StringVar(value=self._add_cmr_dir.get())
+        self._col_merge_rules.append((col, dir_var))
+        self._rebuild_col_merge_ui()
+
+    def _remove_col_merge_rule(self, idx: int):
+        if 0 <= idx < len(self._col_merge_rules):
+            self._col_merge_rules.pop(idx)
+            self._rebuild_col_merge_ui()
 
     def _download_template(self):
         url = self._doc_url.get().strip()
@@ -593,9 +1159,10 @@ class App(ctk.CTk):
         self._btn_gen.configure(state="disabled")
         self._status("Генерация документов…")
 
+        single = self._single_doc.get()
+
         def task():
             try:
-                col = self._filename_col.get().strip() or None
                 group_by = [c for c, _ in self._group_levels] or None
                 label_tpls = [
                     v.get().strip() or "{value}"
@@ -604,17 +1171,50 @@ class App(ctk.CTk):
                 merge_left = self._merge_left.get()
                 merge_right = self._merge_right.get()
                 num_var = self._num_var.get().strip() or None
-                files = generate_documents_for_all_rows(
-                    template_path=tpl_path,
-                    table_name=tbl,
-                    filename_column=col,
-                    db=self.db,
-                    group_by=group_by,
-                    group_label_templates=label_tpls,
-                    merge_empty_cells=merge_left or merge_right,
-                    merge_right=merge_right,
-                    num_var=num_var,
-                )
+
+                column_merge_rules = None
+                if self._col_merge_rules:
+                    column_merge_rules = [
+                        (col, "left" if dir_var.get() == "влево" else "right")
+                        for col, dir_var in self._col_merge_rules
+                    ]
+
+                if single:
+                    headers, all_rows = self.db.get_all_data(tbl)
+                    orig_map = self.db.get_original_headers(tbl)
+                    ts = datetime.now().strftime("%H.%M %d.%m.%Y")
+                    raw_name = self._single_doc_name.get().strip() or "document"
+                    safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", raw_name)
+                    base = safe_name[:-5] if safe_name.lower().endswith(".docx") else safe_name
+                    safe_name = f"{base} ({ts}).docx"
+                    path = generate_document(
+                        template_path=tpl_path,
+                        row_data={},
+                        output_filename=safe_name,
+                        all_rows_data=(headers, all_rows),
+                        original_headers_map=orig_map,
+                        group_by=group_by,
+                        group_label_templates=label_tpls,
+                        merge_empty_cells=merge_left or merge_right,
+                        merge_right=merge_right,
+                        num_var=num_var,
+                        column_merge_rules=column_merge_rules,
+                    )
+                    files = [path]
+                else:
+                    col = self._filename_col.get().strip() or None
+                    files = generate_documents_for_all_rows(
+                        template_path=tpl_path,
+                        table_name=tbl,
+                        filename_column=col,
+                        db=self.db,
+                        group_by=group_by,
+                        group_label_templates=label_tpls,
+                        merge_empty_cells=merge_left or merge_right,
+                        merge_right=merge_right,
+                        num_var=num_var,
+                        column_merge_rules=column_merge_rules,
+                    )
                 self.after(0, lambda: self._gen_ok(files))
             except Exception as e:
                 self.after(0, lambda m=str(e): self._gen_err(m))
@@ -767,7 +1367,7 @@ class App(ctk.CTk):
         ctrl.pack(fill="x", padx=32, pady=(0, 16))
 
         r = ctk.CTkFrame(ctrl, fg_color="transparent")
-        r.pack(fill="x", padx=20, pady=18)
+        r.pack(fill="x", padx=20, pady=(18, 6))
         self._lbl(r, "Таблица:").pack(side="left")
         self._db_tbl = tk.StringVar()
         self._db_combo = self._combo(r, self._db_tbl, width=280)
@@ -776,6 +1376,15 @@ class App(ctk.CTk):
                   ).pack(side="left", padx=(0, 6))
         self._btn(r, "Показать данные", self._show_data, width=140
                   ).pack(side="left")
+
+        r2 = ctk.CTkFrame(ctrl, fg_color="transparent")
+        r2.pack(fill="x", padx=20, pady=(0, 18))
+        self._btn(r2, "Переименовать таблицу", self._open_table_rename_dialog,
+                  primary=False, width=180).pack(side="left", padx=(0, 6))
+        self._btn(r2, "Переименовать столбцы", self._open_rename_dialog,
+                  primary=False, width=180).pack(side="left", padx=(0, 6))
+        self._btn(r2, "Объединить столбцы", self._open_merge_dialog,
+                  primary=False, width=160).pack(side="left")
 
         # Treeview
         tree_card = self._card(f)
@@ -823,30 +1432,37 @@ class App(ctk.CTk):
             font=ctk.CTkFont(family=_FONT, size=12), text_color=_TEXT2,
         ).pack(anchor="w", padx=32, pady=(4, 32))
 
+        self._db_name_map: dict[str, str] = {}
         self._refresh_db()
 
     def _refresh_db(self):
-        tables = self.db.get_table_names()
-        self._db_combo.configure(values=tables)
-        if tables and not self._db_tbl.get():
-            self._db_tbl.set(tables[0])
-        if hasattr(self, "_tpl_combo"):
-            self._tpl_combo.configure(values=tables)
+        tables_info = self.db.get_tables_with_display_names()
+        display_names = [d for _, d in tables_info]
+        self._db_name_map = {d: t for t, d in tables_info}
+        self._db_combo.configure(values=display_names)
+        cur = self._db_tbl.get()
+        if display_names and cur not in display_names:
+            self._db_tbl.set(display_names[0])
 
     def _show_data(self):
-        tbl = self._db_tbl.get()
+        tbl = getattr(self, "_db_name_map", {}).get(self._db_tbl.get(), self._db_tbl.get())
         if not tbl:
             messagebox.showwarning("Внимание", "Выберите таблицу.")
             return
         try:
             headers, rows = self.db.get_all_data(tbl)
             orig = self.db.get_original_headers(tbl)
+            aliases = self.db.get_column_aliases(tbl)
             rev = {v: k for k, v in orig.items()}
 
             self._tree.delete(*self._tree.get_children())
             self._tree["columns"] = headers
             for col in headers:
-                self._tree.heading(col, text=rev.get(col, col))
+                display = aliases.get(col) or rev.get(col, col)
+                self._tree.heading(
+                    col, text=display,
+                    command=lambda c=col, t=tbl: self._rename_column_quick(c, t),
+                )
                 self._tree.column(col, width=140, minwidth=80)
             for i, row in enumerate(rows):
                 tag = "odd" if i % 2 else "even"
@@ -857,10 +1473,141 @@ class App(ctk.CTk):
             self._db_info.set(
                 f"Таблица: {tbl}   ·   "
                 f"Столбцов: {len(headers)}   ·   "
-                f"Строк: {len(rows)}"
+                f"Строк: {len(rows)}   ·   "
+                f"Нажмите на заголовок столбца чтобы переименовать"
             )
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось загрузить данные:\n{e}")
+
+    def _open_rename_dialog(self):
+        tbl = getattr(self, "_db_name_map", {}).get(self._db_tbl.get(), self._db_tbl.get())
+        if not tbl:
+            messagebox.showwarning("Внимание", "Выберите таблицу.")
+            return
+        _ColumnRenameDialog(self, self.db, tbl, on_save=self._show_data)
+
+    def _open_merge_dialog(self):
+        tbl = getattr(self, "_db_name_map", {}).get(self._db_tbl.get(), self._db_tbl.get())
+        if not tbl:
+            messagebox.showwarning("Внимание", "Выберите таблицу.")
+            return
+        _MergeColumnsDialog(self, self.db, tbl, on_merge=self._show_data)
+
+    def _rename_column_quick(self, safe_col: str, table_name: str):
+        """Открывает мини-диалог переименования одного столбца по клику на заголовок."""
+        orig = self.db.get_original_headers(table_name)
+        aliases = self.db.get_column_aliases(table_name)
+        rev = {v: k for k, v in orig.items()}
+        orig_name = rev.get(safe_col, safe_col)
+        current_alias = aliases.get(safe_col, "")
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Переименовать столбец")
+        dialog.geometry("420x210")
+        dialog.resizable(False, False)
+        dialog.configure(fg_color=_BG)
+        dialog.after(150, lambda: dialog.grab_set() if dialog.winfo_exists() else None)
+
+        ctk.CTkLabel(
+            dialog, text=f"Исходное имя: {orig_name}",
+            font=ctk.CTkFont(family=_FONT, size=12), text_color=_TEXT2,
+        ).pack(anchor="w", padx=24, pady=(20, 4))
+        ctk.CTkLabel(
+            dialog, text="Локальное имя:",
+            font=ctk.CTkFont(family=_FONT, size=13), text_color=_TEXT1,
+        ).pack(anchor="w", padx=24, pady=(0, 4))
+
+        var = tk.StringVar(value=current_alias)
+        entry = ctk.CTkEntry(
+            dialog, textvariable=var, width=370,
+            corner_radius=8, border_width=1, border_color=_BORDER,
+            fg_color="white", text_color=_TEXT1,
+            placeholder_text=orig_name,
+            font=ctk.CTkFont(family=_FONT, size=13),
+        )
+        entry.pack(padx=24, pady=(0, 16))
+        entry.focus_set()
+
+        def _save():
+            self.db.set_column_alias(table_name, safe_col, var.get())
+            dialog.destroy()
+            self._show_data()
+
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_row.pack(fill="x", padx=24)
+        ctk.CTkButton(
+            btn_row, text="Отмена", command=dialog.destroy,
+            corner_radius=8, height=36, width=100,
+            fg_color="#E8E8ED", hover_color="#D8D8DD", text_color=_TEXT1,
+            font=ctk.CTkFont(family=_FONT, size=13, weight="bold"),
+        ).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(
+            btn_row, text="Сохранить", command=_save,
+            corner_radius=8, height=36, width=110,
+            fg_color=_ACCENT, hover_color=_ACCENT_H, text_color="white",
+            font=ctk.CTkFont(family=_FONT, size=13, weight="bold"),
+        ).pack(side="right")
+        dialog.bind("<Return>", lambda e: _save())
+
+    def _open_table_rename_dialog(self):
+        """Диалог переименования выбранной таблицы."""
+        disp = self._db_tbl.get()
+        if not disp:
+            messagebox.showwarning("Внимание", "Выберите таблицу.")
+            return
+        tbl = getattr(self, "_db_name_map", {}).get(disp, disp)
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Переименовать таблицу")
+        dialog.geometry("440x210")
+        dialog.resizable(False, False)
+        dialog.configure(fg_color=_BG)
+        dialog.after(150, lambda: dialog.grab_set() if dialog.winfo_exists() else None)
+
+        ctk.CTkLabel(
+            dialog, text=f"Внутреннее имя: {tbl}",
+            font=ctk.CTkFont(family=_FONT, size=12), text_color=_TEXT2,
+        ).pack(anchor="w", padx=24, pady=(20, 4))
+        ctk.CTkLabel(
+            dialog, text="Отображаемое имя:",
+            font=ctk.CTkFont(family=_FONT, size=13), text_color=_TEXT1,
+        ).pack(anchor="w", padx=24, pady=(0, 4))
+
+        # Pre-fill if user already set a custom name
+        prefill = disp if disp != tbl else ""
+        var = tk.StringVar(value=prefill)
+        entry = ctk.CTkEntry(
+            dialog, textvariable=var, width=390,
+            corner_radius=8, border_width=1, border_color=_BORDER,
+            fg_color="white", text_color=_TEXT1,
+            placeholder_text="Введите имя таблицы",
+            font=ctk.CTkFont(family=_FONT, size=13),
+        )
+        entry.pack(padx=24, pady=(0, 16))
+        entry.focus_set()
+
+        def _save():
+            self.db.set_table_display_name(tbl, var.get())
+            dialog.destroy()
+            self._refresh_db()
+            if hasattr(self, "_tbl_picker"):
+                self._refresh_tpl_tables()
+
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_row.pack(fill="x", padx=24)
+        ctk.CTkButton(
+            btn_row, text="Отмена", command=dialog.destroy,
+            corner_radius=8, height=36, width=100,
+            fg_color="#E8E8ED", hover_color="#D8D8DD", text_color=_TEXT1,
+            font=ctk.CTkFont(family=_FONT, size=13, weight="bold"),
+        ).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(
+            btn_row, text="Сохранить", command=_save,
+            corner_radius=8, height=36, width=110,
+            fg_color=_ACCENT, hover_color=_ACCENT_H, text_color="white",
+            font=ctk.CTkFont(family=_FONT, size=13, weight="bold"),
+        ).pack(side="right")
+        dialog.bind("<Return>", lambda e: _save())
 
     # ── Закрытие ──────────────────────────────────────────────────────────────
 

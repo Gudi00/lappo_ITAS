@@ -20,6 +20,7 @@ import copy
 import re
 import shutil
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -208,6 +209,48 @@ def _merge_empty_cells_right(row_element) -> None:
             i += 1
 
 
+def _find_column_indices(tr_element) -> dict[str, int]:
+    """Maps {{ s.ColName }} names (original and sanitized) to cell index in template row."""
+    result: dict[str, int] = {}
+    tcs = tr_element.findall(f'{W_NS}tc')
+    for idx, tc in enumerate(tcs):
+        full_text = ''.join(t.text or '' for t in tc.findall(f'.//{W_NS}t'))
+        for m in re.finditer(r'\{\{\s*s\.(.*?)\}\}', full_text, re.DOTALL):
+            col_name = m.group(1).strip()
+            if col_name not in result:
+                result[col_name] = idx
+            sanitized = re.sub(r'\s+', '_', col_name).lower()
+            if sanitized not in result:
+                result[sanitized] = idx
+    return result
+
+
+def _merge_cells_by_rules(
+    row_element,
+    rules_with_idx: list[tuple[int, str]],
+) -> None:
+    """Merge specific cells by original index and direction (right-to-left to preserve indices)."""
+    tcs = list(row_element.findall(f'{W_NS}tc'))
+    for orig_idx, direction in sorted(rules_with_idx, key=lambda x: x[0], reverse=True):
+        if orig_idx >= len(tcs) or orig_idx < 0:
+            continue
+        tc = tcs[orig_idx]
+        if not _cell_is_empty(tc):
+            continue
+        if direction == 'right' and orig_idx < len(tcs) - 1:
+            right_tc = tcs[orig_idx + 1]
+            _set_cell_grid_span(right_tc,
+                _get_cell_grid_span(right_tc) + _get_cell_grid_span(tc))
+            row_element.remove(tc)
+            tcs.pop(orig_idx)
+        elif direction == 'left' and orig_idx > 0:
+            left_tc = tcs[orig_idx - 1]
+            _set_cell_grid_span(left_tc,
+                _get_cell_grid_span(left_tc) + _get_cell_grid_span(tc))
+            row_element.remove(tc)
+            tcs.pop(orig_idx)
+
+
 def _make_group_header_row(template_row_elem, group_label: str, total_cols: int):
     """
     Создаёт строку-заголовок группы: копия шаблонной строки с одной объединённой
@@ -326,6 +369,9 @@ def _expand_grouped_rows(
     merge_right: bool,
     num_var: Optional[str] = None,
     row_counter: Optional[list] = None,
+    *,
+    column_merge_rules: Optional[list[tuple[str, str]]] = None,
+    col_map: Optional[dict[str, int]] = None,
 ) -> int:
     """
     Рекурсивно вставляет строки: заголовки групп и строки студентов.
@@ -349,6 +395,7 @@ def _expand_grouped_rows(
                 parent, pos, tr_element, children, level + 1,
                 label_templates, total_cols, merge_empty_cells, merge_right,
                 num_var=num_var, row_counter=row_counter,
+                column_merge_rules=column_merge_rules, col_map=col_map,
             )
         else:
             # item — словарь студента
@@ -365,7 +412,15 @@ def _expand_grouped_rows(
                     student[sanitized] = str(row_counter[0])
             tr_copy = copy.deepcopy(tr_element)
             _substitute_student_in_row(tr_copy, student)
-            if merge_empty_cells:
+            if column_merge_rules and col_map:
+                rules_with_idx = [
+                    (col_map[c], d)
+                    for c, d in column_merge_rules
+                    if c in col_map
+                ]
+                if rules_with_idx:
+                    _merge_cells_by_rules(tr_copy, rules_with_idx)
+            elif merge_empty_cells:
                 if merge_right:
                     _merge_empty_cells_right(tr_copy)
                 else:
@@ -431,6 +486,7 @@ def _expand_table_loops(
     merge_empty_cells: bool = True,
     merge_right: bool = False,
     num_var: Optional[str] = None,
+    column_merge_rules: Optional[list[tuple[str, str]]] = None,
 ) -> None:
     """
     Разворачивает циклы в таблицах:
@@ -460,10 +516,15 @@ def _expand_table_loops(
         grouped = _group_students_recursive(students_list, group_by_list)
         row_counter = [0]
 
+        col_map: dict[str, int] = {}
+        if column_merge_rules:
+            col_map = _find_column_indices(tr_element)
+
         _expand_grouped_rows(
             parent, insert_pos, tr_element, grouped, 0,
             label_tpls, total_cols, merge_empty_cells, merge_right,
             num_var=num_var, row_counter=row_counter,
+            column_merge_rules=column_merge_rules, col_map=col_map,
         )
 
         parent.remove(tr_element)
@@ -482,6 +543,7 @@ def generate_document(
     merge_empty_cells: bool = True,
     merge_right: bool = False,
     num_var: Optional[str] = None,
+    column_merge_rules: Optional[list[tuple[str, str]]] = None,
 ) -> Path:
     """
     Генерирует один документ из шаблона.
@@ -526,6 +588,7 @@ def generate_document(
             merge_empty_cells=merge_empty_cells,
             merge_right=merge_right,
             num_var=num_var,
+            column_merge_rules=column_merge_rules,
         )
 
         # Шаг 2: рендерим оставшиеся плейсхолдеры через docxtpl (нетабличные)
@@ -550,6 +613,7 @@ def generate_documents_for_all_rows(
     merge_empty_cells: bool = True,
     merge_right: bool = False,
     num_var: Optional[str] = None,
+    column_merge_rules: Optional[list[tuple[str, str]]] = None,
 ) -> list[Path]:
     """
     Генерирует по одному документу на каждую строку данных в таблице.
@@ -568,6 +632,7 @@ def generate_documents_for_all_rows(
         all_rows_data = (headers, all_rows)
 
         generated: list[Path] = []
+        ts = datetime.now().strftime("%H.%M %d.%m.%Y")
 
         for idx, row in enumerate(all_rows):
             row_data = dict(zip(headers, row))
@@ -575,9 +640,10 @@ def generate_documents_for_all_rows(
             if filename_column and filename_column in row_data:
                 raw_name = str(row_data[filename_column])
                 safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", raw_name).strip()
-                output_name = f"{safe_name or f'document_{idx + 1:03d}'}.docx"
+                base = safe_name or f"document_{idx + 1:03d}"
             else:
-                output_name = f"document_{idx + 1:03d}.docx"
+                base = f"document_{idx + 1:03d}"
+            output_name = f"{base} ({ts}).docx"
 
             path = generate_document(
                 template_path=template_path,
@@ -590,6 +656,7 @@ def generate_documents_for_all_rows(
                 merge_empty_cells=merge_empty_cells,
                 merge_right=merge_right,
                 num_var=num_var,
+                column_merge_rules=column_merge_rules,
             )
             generated.append(path)
 
