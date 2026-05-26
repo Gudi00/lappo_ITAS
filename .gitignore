@@ -104,3 +104,56 @@ yarn-error.log*
 # ── OS ───────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+
+# ── Auto-generated cleanup block ──
+# Environment & secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+credentials.json
+token.json
+*.session
+*.session-journal
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+db.sqlite3
+
+# Python
+venv/
+.venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / JS
+node_modules/
+dist/
+build/
+.next/
+.expo/
+
+# IDE / Editors
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# AI / Vibe-coding artifacts
+.cursorrules
+.cursor/
+.aider*
+.claude/
+.gemini/
+.windsurf/
+.codeium/
+CLAUDE.md
