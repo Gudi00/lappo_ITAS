@@ -20,6 +20,62 @@ from google_docs import download_template, extract_doc_id
 from template_engine import find_placeholders, generate_documents_for_all_rows, generate_document
 from email_sender import EmailSender
 
+# ── Фикс выпадающих списков ───────────────────────────────────────────────────
+# На Linux CTkComboBox/CTkOptionMenu открывают нативное меню через tk_popup
+# прямо в обработчике НАЖАТИЯ. Следом приходит событие ОТПУСКАНИЯ кнопки и,
+# поскольку курсор ещё не над пунктом меню, тут же его закрывает — если не
+# двигать мышью, список «мигает» и исчезает. Чтобы это исправить, открываем
+# меню только ПОСЛЕ отпускания кнопки. Тогда список остаётся открытым и
+# закрывается лишь по выбору значения или клику за его пределами.
+import sys as _sys
+from customtkinter.windows.widgets.core_widget_classes.dropdown_menu import (
+    DropdownMenu as _DropdownMenu,
+)
+
+
+def _dropdown_open_persistent(self, x, y):
+    if _sys.platform == "darwin":
+        y += self._apply_widget_scaling(8)
+        self.post(int(x), int(y))
+        return
+    if _sys.platform.startswith("win"):
+        y += self._apply_widget_scaling(3)
+        self.post(int(x), int(y))
+        return
+
+    # Linux
+    y += self._apply_widget_scaling(3)
+    ix, iy = int(x), int(y)
+    root = self.winfo_toplevel()
+    state = {"done": False, "bind_id": None, "after_id": None}
+
+    def _pop(_evt=None):
+        if state["done"]:
+            return
+        state["done"] = True
+        if state["bind_id"] is not None:
+            try:
+                root.unbind("<ButtonRelease-1>", state["bind_id"])
+            except Exception:
+                pass
+        if state["after_id"] is not None:
+            try:
+                self.after_cancel(state["after_id"])
+            except Exception:
+                pass
+        try:
+            self.tk_popup(ix, iy)
+        except Exception:
+            pass
+
+    # Откроем меню на отпускании кнопки мыши…
+    state["bind_id"] = root.bind("<ButtonRelease-1>", _pop, add="+")
+    # …либо по таймеру, если кнопка была отпущена раньше, чем мы подписались.
+    state["after_id"] = self.after(150, _pop)
+
+
+_DropdownMenu.open = _dropdown_open_persistent
+
 # ── Тема ──────────────────────────────────────────────────────────────────────
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
@@ -69,26 +125,65 @@ class _NavButton(ctk.CTkButton):
 
 class _TablePickerWidget(ctk.CTkFrame):
     """
-    Compact table-selector: clickable rows with hover-preview popup.
-    The preview appears after a short delay and shows the first rows of data.
-    selected_var always holds the *internal* SQLite table name.
+    Collapsible table-selector: a header shows the current table and toggles an
+    expandable list of all tables. Hovering a row shows a large (≈half-screen)
+    data-preview popup that stays visible while the cursor is on the list or the
+    popup itself. selected_var always holds the *internal* SQLite table name.
     """
-    _DELAY_MS = 380
+    _DELAY_MS = 120
+
+    _HEAD_BG  = "#F7F9FC"   # фон шапки (свёрнуто)
+    _HEAD_HOV = "#ECF3FF"   # фон шапки при наведении
 
     def __init__(self, parent, db, selected_var: tk.StringVar, **kw):
         super().__init__(
-            parent, fg_color="white", corner_radius=8,
+            parent, fg_color="white", corner_radius=10,
             border_width=1, border_color=_BORDER, **kw,
         )
         self._db = db
         self._sel = selected_var
         self._tables: list[tuple[str, str]] = []
         self._popup = None
-        self._after_id = None      # timer: show popup
-        self._hide_after_id = None # timer: hide popup
+        self._preview_internal = None  # what the popup currently shows
+        self._after_id = None          # timer: show popup
+        self._hide_after_id = None     # timer: hide popup
+        self._expanded = False
 
+        # Header (always visible) — toggles the expandable list. Стилизован
+        # как аккуратная кнопка-селектор с иконкой и акцентным шевроном.
+        self._header = tk.Frame(self, bg=self._HEAD_BG, cursor="hand2")
+        self._header.pack(fill="x")
+        self._icon = tk.Label(self._header, text="⊞", bg=self._HEAD_BG, fg=_ACCENT,
+                              font=(_FONT, 14), padx=12, pady=11)
+        self._icon.pack(side="left")
+        self._header_lbl = tk.Label(self._header, text="—", bg=self._HEAD_BG,
+                                    fg=_TEXT1,
+                                    font=(_FONT, 13, "bold"), anchor="w", pady=11)
+        self._header_lbl.pack(side="left", fill="x", expand=True)
+        self._header_cnt = tk.Label(self._header, text="", bg=self._HEAD_BG, fg=_TEXT2,
+                                    font=(_FONT, 11), padx=8, pady=11)
+        self._header_cnt.pack(side="right")
+        self._chevron = tk.Label(self._header, text="⌄", bg=self._HEAD_BG, fg=_ACCENT,
+                                 font=(_FONT, 14, "bold"), padx=12, pady=9)
+        self._chevron.pack(side="right")
+
+        self._head_widgets = (self._header, self._icon, self._header_lbl,
+                              self._header_cnt, self._chevron)
+        for w in self._head_widgets:
+            w.bind("<Button-1>", lambda e: self._toggle())
+            w.bind("<Enter>", lambda e: self._tint_header(self._HEAD_HOV))
+            w.bind("<Leave>", lambda e: self._tint_header(self._HEAD_BG))
+
+        # Separator + container for the expandable list (hidden when collapsed)
+        self._sep = tk.Frame(self, bg=_BORDER, height=1)
         self._inner = tk.Frame(self, bg="white")
-        self._inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+    def _tint_header(self, bg: str) -> None:
+        for w in self._head_widgets:
+            try:
+                w.configure(bg=bg)
+            except Exception:
+                pass
 
     # ── public ────────────────────────────────────────────────────────────────
 
@@ -98,9 +193,52 @@ class _TablePickerWidget(ctk.CTkFrame):
         internals = [t[0] for t in tables]
         if self._sel.get() not in internals and internals:
             self._sel.set(internals[0])
+        self._update_header()
+        if self._expanded:
+            self._rebuild()
+
+    # ── header / expand-collapse ────────────────────────────────────────────────
+
+    def _update_header(self) -> None:
+        sel = self._sel.get()
+        disp = next((d for t, d in self._tables if t == sel), None)
+        if disp is None:
+            self._header_lbl.configure(text="Нет загруженных таблиц", fg=_TEXT2)
+            self._header_cnt.configure(text="")
+            return
+        self._header_lbl.configure(text=disp, fg=_TEXT1)
+        try:
+            self._header_cnt.configure(text=f"{self._db.get_row_count(sel)} стр.")
+        except Exception:
+            self._header_cnt.configure(text="")
+
+    def _toggle(self) -> None:
+        if self._expanded:
+            self._collapse()
+        else:
+            self._expand()
+
+    def _expand(self) -> None:
+        if self._expanded:
+            return
+        self._expanded = True
+        self._chevron.configure(text="⌃")
+        self.configure(border_color=_ACCENT)
+        self._sep.pack(fill="x")
+        self._inner.pack(fill="both", expand=True)
         self._rebuild()
 
-    # ── internal ──────────────────────────────────────────────────────────────
+    def _collapse(self) -> None:
+        self._expanded = False
+        self._chevron.configure(text="⌄")
+        self.configure(border_color=_BORDER)
+        self._hide_popup()
+        self._inner.pack_forget()
+        self._sep.pack_forget()
+        for w in self._inner.winfo_children():
+            w.destroy()
+
+    # ── list rendering ───────────────────────────────────────────────────────────
 
     def _rebuild(self) -> None:
         for w in self._inner.winfo_children():
@@ -149,18 +287,25 @@ class _TablePickerWidget(ctk.CTkFrame):
                                  self._on_leave(r, s))
 
     def _on_click(self, internal: str) -> None:
-        self._hide_popup()
         self._sel.set(internal)
-        self._rebuild()
+        self._update_header()
+        self._collapse()
 
     def _on_enter(self, event, internal: str, row: tk.Frame, is_sel: bool) -> None:
         if not is_sel:
             self._tint(row, "#EBF4FF", _TEXT1, _TEXT2)
+        # cursor is back over the list → keep any open popup alive
+        self._cancel_hide()
+        # if the popup already shows this table, nothing to do
+        if self._popup is not None and self._preview_internal == internal:
+            if self._after_id:
+                self.after_cancel(self._after_id)
+                self._after_id = None
+            return
         if self._after_id:
             self.after_cancel(self._after_id)
         self._after_id = self.after(
-            self._DELAY_MS,
-            lambda: self._show_popup(internal, event.x_root, event.y_root),
+            self._DELAY_MS, lambda: self._show_popup(internal),
         )
 
     def _on_leave(self, row: tk.Frame, is_sel: bool) -> None:
@@ -171,7 +316,7 @@ class _TablePickerWidget(ctk.CTkFrame):
             self._after_id = None
         if self._hide_after_id:
             self.after_cancel(self._hide_after_id)
-        self._hide_after_id = self.after(600, self._maybe_hide)
+        self._hide_after_id = self.after(250, self._maybe_hide)
 
     def _tint(self, row: tk.Frame, bg: str, fg: str, fg2: str) -> None:
         try:
@@ -182,29 +327,33 @@ class _TablePickerWidget(ctk.CTkFrame):
         except Exception:
             pass
 
+    # ── popup lifecycle ──────────────────────────────────────────────────────────
+
     def _cancel_hide(self) -> None:
-        """Cancel a pending hide timer (called when cursor enters the popup)."""
+        """Cancel a pending hide timer (cursor is over the list or the popup)."""
         if self._hide_after_id:
             self.after_cancel(self._hide_after_id)
             self._hide_after_id = None
+
+    def _pointer_inside(self, widget) -> bool:
+        try:
+            if widget is None or not widget.winfo_exists():
+                return False
+            x, y = widget.winfo_rootx(), widget.winfo_rooty()
+            w = max(widget.winfo_width(), widget.winfo_reqwidth())
+            h = max(widget.winfo_height(), widget.winfo_reqheight())
+            mx, my = widget.winfo_pointerx(), widget.winfo_pointery()
+            return x <= mx <= x + w and y <= my <= y + h
+        except Exception:
+            return False
 
     def _maybe_hide(self) -> None:
         self._hide_after_id = None
         if self._popup is None:
             return
-        try:
-            if not self._popup.winfo_exists():
-                self._popup = None
-                return
-            px, py = self._popup.winfo_rootx(), self._popup.winfo_rooty()
-            pw = max(self._popup.winfo_width(), self._popup.winfo_reqwidth())
-            ph = max(self._popup.winfo_height(), self._popup.winfo_reqheight())
-            mx = self._popup.winfo_pointerx()
-            my = self._popup.winfo_pointery()
-            if px <= mx <= px + pw and py <= my <= py + ph:
-                return
-        except Exception:
-            pass
+        # stay open while the cursor is over the popup or the expandable list
+        if self._pointer_inside(self._popup) or self._pointer_inside(self._inner):
+            return
         self._hide_popup()
 
     def _hide_popup(self) -> None:
@@ -221,8 +370,10 @@ class _TablePickerWidget(ctk.CTkFrame):
             except Exception:
                 pass
         self._popup = None
+        self._preview_internal = None
 
-    def _show_popup(self, internal: str, rx: int, ry: int) -> None:
+    def _show_popup(self, internal: str) -> None:
+        self._after_id = None
         self._hide_popup()
         try:
             headers, rows = self._db.get_all_data(internal)
@@ -234,8 +385,18 @@ class _TablePickerWidget(ctk.CTkFrame):
         if not headers:
             return
 
-        cols      = headers[:5]
-        prev_rows = rows[:6]
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        # preview occupies ≈half the screen
+        pw = sw // 2
+        ph = sh // 2
+
+        _ROW_H = 24
+        cols = headers                  # показываем все столбцы (есть гор. скролл)
+        # Загружаем все строки (с разумным потолком) — вертикальный скролл
+        # позволяет листать таблицу вниз.
+        _MAX_ROWS = 2000
+        prev_rows = rows[:_MAX_ROWS]
 
         popup = tk.Toplevel()
         popup.overrideredirect(True)
@@ -259,15 +420,15 @@ class _TablePickerWidget(ctk.CTkFrame):
         hdr = tk.Frame(inner, bg=_BG)
         hdr.pack(fill="x")
         tk.Label(hdr, text=f"  {disp_name}", bg=_BG, fg=_TEXT1,
-                 font=(_FONT, 12, "bold"), anchor="w", pady=7).pack(side="left")
+                 font=(_FONT, 13, "bold"), anchor="w", pady=8).pack(side="left")
         tk.Label(hdr, text=f"{total} строк  ", bg=_BG, fg=_TEXT2,
-                 font=(_FONT, 11), anchor="e", pady=7).pack(side="right")
+                 font=(_FONT, 11), anchor="e", pady=8).pack(side="right")
         tk.Frame(inner, bg=_BORDER, height=1).pack(fill="x")
 
-        # Mini Treeview
+        # Treeview (fills the rest of the half-screen popup)
         _SN = "PopPrev.Treeview"
         sty = tkttk.Style()
-        sty.configure(_SN, rowheight=22, font=(_FONT, 11),
+        sty.configure(_SN, rowheight=_ROW_H, font=(_FONT, 11),
                       background="white", fieldbackground="white",
                       foreground=_TEXT1, borderwidth=0)
         sty.configure(f"{_SN}.Heading", font=(_FONT, 10, "bold"),
@@ -276,52 +437,60 @@ class _TablePickerWidget(ctk.CTkFrame):
                 background=[("selected", "#E3EEFB")],
                 foreground=[("selected", _TEXT1)])
 
-        col_widths = []
+        body = tk.Frame(inner, bg="white")
+        body.pack(fill="both", expand=True, padx=4, pady=4)
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+
+        tree = tkttk.Treeview(body, columns=cols, show="headings", style=_SN)
+        vsb = tkttk.Scrollbar(body, orient="vertical", command=tree.yview)
+        hsb = tkttk.Scrollbar(body, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        # Ширина столбца ≈ средней длине его значений (с учётом заголовка),
+        # чтобы данные читались, а не растягивались по выбросам.
+        _idx = {c: headers.index(c) for c in cols if c in headers}
+        _sample = prev_rows[:200]
         for col in cols:
             disp = aliases.get(col) or rev.get(col, col)
-            max_vl = max(
-                (len(str(r[headers.index(col)])) for r in prev_rows
-                 if headers.index(col) < len(r)),
-                default=0,
-            )
-            col_widths.append(min(max(len(disp) * 8 + 20, max_vl * 7 + 10, 70), 160))
-
-        tree = tkttk.Treeview(inner, columns=cols, show="headings",
-                               style=_SN, height=min(len(prev_rows), 6))
-        for col, w in zip(cols, col_widths):
-            disp = aliases.get(col) or rev.get(col, col)
+            i = _idx.get(col)
+            if i is not None and _sample:
+                lens = [len(str(r[i])) for r in _sample if i < len(r)]
+                avg_len = (sum(lens) / len(lens)) if lens else 0
+            else:
+                avg_len = 0
+            char_len = max(len(str(disp)), avg_len)
+            width = int(min(max(char_len * 7.5 + 24, 70), 360))
             tree.heading(col, text=disp)
-            tree.column(col, width=w, minwidth=40, stretch=False)
+            tree.column(col, width=width, minwidth=50, stretch=False, anchor="w")
 
         for row_data in prev_rows:
             vals = [
-                str(row_data[headers.index(c)])[:28] if c in headers else ""
+                str(row_data[headers.index(c)])[:120] if c in headers else ""
                 for c in cols
             ]
             tree.insert("", "end", values=vals)
-        tree.pack(padx=4, pady=4)
 
-        if len(rows) > 6:
-            more = total - 6 if isinstance(total, int) else "…"
-            tk.Label(inner, text=f"  … ещё {more} строк",
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
+        if len(rows) > len(prev_rows):
+            more = total - len(prev_rows) if isinstance(total, int) else "…"
+            tk.Label(inner, text=f"  … ещё {more} строк (показаны первые {len(prev_rows)})",
                      bg="white", fg=_TEXT2, font=(_FONT, 10),
                      anchor="w", pady=4).pack(fill="x", padx=8)
 
-        popup.update_idletasks()
-        pw  = popup.winfo_reqwidth()
-        ph  = popup.winfo_reqheight()
-        sw  = popup.winfo_screenwidth()
-        sh  = popup.winfo_screenheight()
-        px  = rx + 16
-        py  = ry - 30
+        # Position: to the right of the picker, vertically centred, clamped
+        px = self.winfo_rootx() + self.winfo_width() + 16
         if px + pw > sw - 10:
-            px = rx - pw - 16
-        if py + ph > sh - 10:
-            py = sh - ph - 10
-        popup.geometry(f"+{max(0, px)}+{max(0, py)}")
+            px = self.winfo_rootx() - pw - 16
+        py = max(10, min(self.winfo_rooty(), sh - ph - 10))
+        popup.geometry(f"{pw}x{ph}+{max(0, px)}+{py}")
         self._popup = popup
+        self._preview_internal = internal
         popup.bind("<Enter>", lambda e: self._cancel_hide())
-        popup.bind("<Leave>", lambda e: self.after(300, self._maybe_hide))
+        popup.bind("<Leave>", lambda e: self.after(250, self._maybe_hide))
 
 
 class _ColumnRenameDialog(ctk.CTkToplevel):
