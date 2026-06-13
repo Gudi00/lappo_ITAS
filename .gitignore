@@ -42,3 +42,9 @@ templates_cache/
 # OS
 .DS_Store
 Thumbs.db
+
+# SQLite WAL
+*.db
+*.db-shm
+*.db-wal
+*.db-journal

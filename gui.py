@@ -76,6 +76,52 @@ def _dropdown_open_persistent(self, x, y):
 
 _DropdownMenu.open = _dropdown_open_persistent
 
+
+# ── Фикс прокрутки колёсиком на Linux ─────────────────────────────────────────
+# CTkScrollableFrame слушает только <MouseWheel>, но на Linux/X11 колесо мыши
+# приходит как <Button-4> (вверх) и <Button-5> (вниз). Из-за этого прокрутка
+# колёсиком не работает и нижняя часть страниц (например, журналы) недоступна.
+# Добавляем обработку этих событий ко всем прокручиваемым фреймам.
+if _sys.platform.startswith("linux"):
+    _orig_sf_init = ctk.CTkScrollableFrame.__init__
+
+    def _sf_linux_wheel(self, event):
+        if not self.check_if_master_is_canvas(event.widget):
+            return
+        step = -40 if event.num == 4 else 40
+        if getattr(self, "_shift_pressed", False):
+            if self._parent_canvas.xview() != (0.0, 1.0):
+                self._parent_canvas.xview_scroll(step, "units")
+        elif self._parent_canvas.yview() != (0.0, 1.0):
+            self._parent_canvas.yview_scroll(step, "units")
+
+    def _sf_init_linux(self, *args, **kwargs):
+        _orig_sf_init(self, *args, **kwargs)
+        try:
+            self._parent_canvas.configure(yscrollincrement=1, xscrollincrement=1)
+        except Exception:
+            pass
+        self.bind_all("<Button-4>", self._sf_linux_wheel, add="+")
+        self.bind_all("<Button-5>", self._sf_linux_wheel, add="+")
+
+    ctk.CTkScrollableFrame._sf_linux_wheel = _sf_linux_wheel
+    ctk.CTkScrollableFrame.__init__ = _sf_init_linux
+
+
+# ── Рендер шаблона письма ─────────────────────────────────────────────────────
+# Подставляет значения в плейсхолдеры. Понимает оба вида разметки: одинарные
+# {имя} (как в редакторе) и двойные {{ имя }} (как в шаблонах Word/Google Docs).
+# Неизвестные плейсхолдеры остаются нетронутыми.
+_PH_DOUBLE = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+_PH_SINGLE = re.compile(r"\{\s*([^{}]+?)\s*\}")
+
+
+def _render_message(text: str, values: dict[str, str]) -> str:
+    def repl(m):
+        return values.get(m.group(1).strip(), m.group(0))
+    return _PH_SINGLE.sub(repl, _PH_DOUBLE.sub(repl, text))
+
+
 # ── Тема ──────────────────────────────────────────────────────────────────────
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
@@ -970,6 +1016,8 @@ class App(ctk.CTk):
         self._status("Готово")
         self._append(self._log_sheets, f"✓ Загружено: «{tbl}», строк: {cnt}")
         self._refresh_sheets_list()
+        if hasattr(self, "_em_combo"):
+            self._refresh_email_tables()
         messagebox.showinfo("Успех", f"Таблица: {tbl}\nСтрок: {cnt}")
 
     def _sheet_err(self, err):
@@ -1457,9 +1505,111 @@ class App(ctk.CTk):
         self._btn_send = self._btn(card, "  Отправить  ", self._send_email, width=150)
         self._btn_send.pack(anchor="w", padx=20, pady=(0, 20))
 
+        # ── Рассылка по таблице: напоминания о незаполненных полях ──────────────
+        c2 = self._card(f)
+        c2.pack(fill="x", padx=32, pady=(0, 16))
+
+        ctk.CTkLabel(
+            c2, text="Напоминания о незаполненных полях",
+            font=ctk.CTkFont(family=_FONT, size=15, weight="bold"),
+            text_color=_TEXT1,
+        ).pack(anchor="w", padx=20, pady=(18, 2))
+        self._lbl(
+            c2,
+            "Берёт адреса из выбранного столбца и пишет только тем, у кого "
+            "не заполнены отмеченные обязательные поля, перечисляя их в письме.",
+            secondary=True,
+        ).pack(anchor="w", padx=20, pady=(0, 12))
+
+        # Таблица
+        rt = ctk.CTkFrame(c2, fg_color="transparent")
+        rt.pack(fill="x", padx=20, pady=(0, 10))
+        self._lbl(rt, "Таблица:").pack(side="left")
+        self._em_table = tk.StringVar()
+        self._em_combo = self._combo(rt, self._em_table, width=260)
+        self._em_combo.pack(side="left", padx=(10, 6))
+        self._btn(rt, "Обновить", self._refresh_email_tables,
+                  primary=False, width=100).pack(side="left")
+        self._em_name_map: dict[str, str] = {}
+        self._em_col_map: dict[str, str] = {}
+        self._em_req_vars: dict[str, tuple[tk.BooleanVar, str]] = {}
+        self._em_table.trace_add("write", lambda *_: self._on_email_table_changed())
+
+        # Столбец с почтой
+        rm = ctk.CTkFrame(c2, fg_color="transparent")
+        rm.pack(fill="x", padx=20, pady=(0, 10))
+        self._lbl(rm, "Столбец с почтой:").pack(side="left")
+        self._em_mail_col = tk.StringVar()
+        self._em_mail_combo = self._combo(rm, self._em_mail_col, width=260)
+        self._em_mail_combo.pack(side="left", padx=(10, 0))
+
+        # Обязательные к заполнению поля
+        self._lbl(c2, "Обязательные к заполнению поля (отметьте):").pack(
+            anchor="w", padx=20, pady=(0, 4))
+        self._em_req_frame = ctk.CTkScrollableFrame(
+            c2, height=130, fg_color="white", corner_radius=8,
+            border_width=1, border_color=_BORDER,
+        )
+        self._em_req_frame.pack(fill="x", padx=20, pady=(0, 12))
+
+        # Тема
+        self._lbl(c2, "Тема письма").pack(anchor="w", padx=20, pady=(0, 4))
+        self._em_subj2 = tk.StringVar(value="Просьба заполнить недостающие данные")
+        self._entry(c2, var=self._em_subj2).pack(fill="x", padx=20, pady=(0, 12))
+
+        # Текст письма — можно ввести вручную или загрузить из Word/Google Docs
+        self._lbl(
+            c2,
+            "Текст письма   ·   плейсхолдеры: {missing} — список полей, "
+            "{email}, {Название столбца}   (работает и {{ … }})",
+        ).pack(anchor="w", padx=20, pady=(0, 4))
+
+        src = ctk.CTkFrame(c2, fg_color="transparent")
+        src.pack(fill="x", padx=20, pady=(0, 6))
+        self._lbl(src, "Шаблон из файла:").pack(side="left")
+        self._btn(src, "Из Word…", self._load_msg_from_word,
+                  primary=False, width=110).pack(side="left", padx=(10, 6))
+        self._btn(src, "Из Google Docs…", self._load_msg_from_gdoc,
+                  primary=False, width=150).pack(side="left")
+        self._em_tpl_name = tk.StringVar(value="")
+        ctk.CTkLabel(
+            src, textvariable=self._em_tpl_name,
+            font=ctk.CTkFont(family=_FONT, size=12), text_color=_SUCCESS,
+        ).pack(side="left", padx=(10, 0))
+
+        self._em_body2 = ctk.CTkTextbox(
+            c2, height=130, corner_radius=8,
+            border_width=1, border_color=_BORDER,
+            fg_color="white", text_color=_TEXT1,
+            font=ctk.CTkFont(family=_FONT, size=13),
+        )
+        self._em_body2.pack(fill="x", padx=20, pady=(0, 12))
+        self._em_body2.insert(
+            "1.0",
+            "Здравствуйте!\n\n"
+            "По нашим данным у вас не заполнены следующие обязательные поля:\n"
+            "{missing}\n\n"
+            "Пожалуйста, заполните их в ближайшее время.\n\n"
+            "С уважением,\nАдминистрация",
+        )
+
+        self._em_dry2 = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            c2, text="Тестовый режим (письма не отправляются)",
+            variable=self._em_dry2,
+            corner_radius=4, fg_color=_ACCENT, hover_color=_ACCENT_H,
+            font=ctk.CTkFont(family=_FONT, size=13), text_color=_TEXT1,
+        ).pack(anchor="w", padx=20, pady=(0, 14))
+
+        self._btn_send_reminders = self._btn(
+            c2, "  Отправить напоминания  ", self._send_reminders, width=230)
+        self._btn_send_reminders.pack(anchor="w", padx=20, pady=(0, 20))
+
         self._lbl(f, "Журнал отправки").pack(anchor="w", padx=32, pady=(0, 6))
         self._log_email = self._logbox(f, height=200)
         self._log_email.pack(fill="x", padx=32, pady=(0, 32))
+
+        self._refresh_email_tables()
 
     def _pick_attach(self):
         p = filedialog.askopenfilename(
@@ -1468,6 +1618,271 @@ class App(ctk.CTk):
         )
         if p:
             self._attach.set(p)
+
+    # ── Шаблон письма из Word / Google Docs ────────────────────────────────────
+
+    @staticmethod
+    def _extract_docx_text(path: Path) -> str:
+        """Достаёт текст письма из .docx (абзацы и ячейки таблиц)."""
+        from docx import Document
+        doc = Document(str(path))
+        parts = [p.text for p in doc.paragraphs]
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    cell_txt = "\n".join(
+                        p.text for p in cell.paragraphs if p.text.strip())
+                    if cell_txt:
+                        parts.append(cell_txt)
+        return "\n".join(parts).strip()
+
+    def _set_msg_body(self, text: str) -> None:
+        self._em_body2.delete("1.0", "end")
+        self._em_body2.insert("1.0", text)
+
+    def _load_msg_from_word(self):
+        p = filedialog.askopenfilename(
+            title="Выберите шаблон письма (Word)",
+            filetypes=[("Word", "*.docx"), ("Все", "*.*")],
+        )
+        if not p:
+            return
+        try:
+            text = self._extract_docx_text(Path(p))
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось прочитать документ:\n{e}")
+            return
+        if not text:
+            messagebox.showwarning("Внимание", "Документ пуст — текст не найден.")
+            return
+        self._set_msg_body(text)
+        self._em_tpl_name.set(f"✓ {Path(p).name}")
+        self._append(self._log_email, f"Шаблон письма загружен из Word: {Path(p).name}")
+
+    def _load_msg_from_gdoc(self):
+        dlg = ctk.CTkInputDialog(
+            text="Вставьте ссылку на Google Docs:",
+            title="Шаблон письма из Google Docs",
+        )
+        url = (dlg.get_input() or "").strip()
+        if not url:
+            return
+        if not extract_doc_id(url):
+            messagebox.showerror("Ошибка", "Некорректная ссылка на Google Docs.")
+            return
+        self._status("Скачивание шаблона письма…")
+        self._append(self._log_email, f"→ Шаблон письма из Google Docs: {url}")
+
+        def task():
+            try:
+                path = download_template(url, self.db)
+                text = self._extract_docx_text(path)
+                self.after(0, lambda: self._gdoc_msg_ok(text, path))
+            except Exception as e:
+                self.after(0, lambda m=str(e): self._gdoc_msg_err(m))
+
+        self._run(task)
+
+    def _gdoc_msg_ok(self, text, path):
+        self._status("Готово")
+        if not text:
+            messagebox.showwarning("Внимание", "Документ пуст — текст не найден.")
+            return
+        self._set_msg_body(text)
+        self._em_tpl_name.set(f"✓ {path.name}")
+        self._append(self._log_email,
+                     f"Шаблон письма загружен из Google Docs: {path.name}")
+
+    def _gdoc_msg_err(self, err):
+        self._status("Ошибка", ok=False)
+        self._append(self._log_email, f"✗ {err}")
+        messagebox.showerror("Ошибка", err)
+
+    # ── Рассылка напоминаний по таблице ────────────────────────────────────────
+
+    def _refresh_email_tables(self):
+        tables_info = self.db.get_tables_with_display_names()
+        display = [d for _, d in tables_info]
+        self._em_name_map = {d: t for t, d in tables_info}
+        self._em_combo.configure(values=display)
+        cur = self._em_table.get()
+        if display and cur not in display:
+            self._em_table.set(display[0])   # триггерит _on_email_table_changed
+        else:
+            self._on_email_table_changed()
+
+    def _email_columns(self, tbl: str):
+        """Возвращает (список отображаемых имён, map отображаемое→safe)."""
+        cols_disp: list[str] = []
+        col_map: dict[str, str] = {}
+        if not tbl:
+            return cols_disp, col_map
+        try:
+            headers, _ = self.db.get_all_data(tbl)
+            orig = self.db.get_original_headers(tbl)
+            aliases = self.db.get_column_aliases(tbl)
+            rev = {v: k for k, v in orig.items()}
+        except Exception:
+            return cols_disp, col_map
+        for safe in headers:
+            disp = aliases.get(safe) or rev.get(safe, safe)
+            cols_disp.append(disp)
+            col_map[disp] = safe
+        return cols_disp, col_map
+
+    def _on_email_table_changed(self):
+        if not hasattr(self, "_em_mail_combo"):
+            return
+        tbl = self._em_name_map.get(self._em_table.get())
+        cols_disp, self._em_col_map = self._email_columns(tbl)
+
+        # столбец с почтой — авто-угадывание похожего на email
+        self._em_mail_combo.configure(values=cols_disp)
+        cur = self._em_mail_col.get()
+        if cols_disp and cur not in cols_disp:
+            guess = next(
+                (d for d in cols_disp
+                 if any(k in d.lower()
+                        for k in ("mail", "почт", "email", "e-mail", "@"))),
+                cols_disp[0],
+            )
+            self._em_mail_col.set(guess)
+        elif not cols_disp:
+            self._em_mail_col.set("")
+
+        self._rebuild_required_fields(cols_disp)
+
+    def _rebuild_required_fields(self, cols_disp: list[str]):
+        for w in self._em_req_frame.winfo_children():
+            w.destroy()
+        self._em_req_vars = {}
+        if not cols_disp:
+            self._lbl(self._em_req_frame, "Сначала выберите таблицу",
+                      secondary=True).pack(padx=12, pady=8)
+            return
+        for disp in cols_disp:
+            safe = self._em_col_map.get(disp, disp)
+            var = tk.BooleanVar(value=False)
+            self._em_req_vars[safe] = (var, disp)
+            ctk.CTkCheckBox(
+                self._em_req_frame, text=disp, variable=var,
+                corner_radius=4, fg_color=_ACCENT, hover_color=_ACCENT_H,
+                font=ctk.CTkFont(family=_FONT, size=13), text_color=_TEXT1,
+            ).pack(anchor="w", padx=10, pady=3)
+
+    def _send_reminders(self):
+        tbl = self._em_name_map.get(self._em_table.get())
+        if not tbl:
+            messagebox.showwarning("Внимание", "Выберите таблицу.")
+            return
+        mail_safe = self._em_col_map.get(self._em_mail_col.get())
+        if not mail_safe:
+            messagebox.showwarning("Внимание", "Выберите столбец с почтой.")
+            return
+        required = [(safe, disp) for safe, (var, disp) in self._em_req_vars.items()
+                    if var.get()]
+        if not required:
+            messagebox.showwarning(
+                "Внимание", "Отметьте хотя бы одно обязательное поле.")
+            return
+        subj_tpl = self._em_subj2.get().strip()
+        body_tpl = self._em_body2.get("1.0", "end").strip()
+        if not subj_tpl:
+            messagebox.showwarning("Внимание", "Укажите тему письма.")
+            return
+        if not body_tpl:
+            messagebox.showwarning("Внимание", "Введите текст письма.")
+            return
+
+        dry = self._em_dry2.get()
+        self._btn_send_reminders.configure(state="disabled")
+        self._status("Подготовка рассылки…")
+        self._append(self._log_email,
+                     f"→ Напоминания по «{self._em_table.get()}», "
+                     f"полей: {len(required)}")
+
+        def task():
+            try:
+                headers, rows = self.db.get_all_data(tbl)
+                orig = self.db.get_original_headers(tbl)
+                aliases = self.db.get_column_aliases(tbl)
+                rev = {v: k for k, v in orig.items()}
+                idx = {h: i for i, h in enumerate(headers)}
+                mail_i = idx.get(mail_safe)
+
+                def disp_of(safe):
+                    return aliases.get(safe) or rev.get(safe, safe)
+
+                def cell(row, safe):
+                    i = idx.get(safe)
+                    if i is None or i >= len(row) or row[i] is None:
+                        return ""
+                    return str(row[i])
+
+                sender = EmailSender(db=self.db, dry_run=dry)
+                res = {"sent": 0, "failed": 0, "skipped": 0, "errors": []}
+
+                for row in rows:
+                    missing = [disp for safe, disp in required
+                               if cell(row, safe).strip() == ""]
+                    if not missing:
+                        continue  # всё заполнено — не беспокоим
+                    email = cell(row, mail_safe).strip() if mail_i is not None else ""
+                    if "@" not in email:
+                        res["skipped"] += 1
+                        res["errors"].append(
+                            f"(нет адреса) не заполнено: {', '.join(missing)}")
+                        continue
+
+                    values = {
+                        "missing": "\n".join(f"• {m}" for m in missing),
+                        "email": email,
+                    }
+                    for safe in headers:
+                        val = cell(row, safe)
+                        values[disp_of(safe)] = val
+                        values[safe] = val
+
+                    subj = _render_message(subj_tpl, values)
+                    body = _render_message(body_tpl, values)
+
+                    try:
+                        sender.send_email(to=email, subject=subj, body=body)
+                        res["sent"] += 1
+                        self.after(0, lambda e=email, m=list(missing):
+                                   self._append(self._log_email,
+                                                f"  → {e}: {', '.join(m)}"))
+                    except Exception as ex:
+                        res["failed"] += 1
+                        res["errors"].append(f"{email}: {ex}")
+
+                self.after(0, lambda: self._reminders_ok(res, dry))
+            except Exception as e:
+                self.after(0, lambda m=str(e): self._reminders_err(m))
+
+        self._run(task)
+
+    def _reminders_ok(self, res, dry):
+        self._btn_send_reminders.configure(state="normal")
+        self._status("Готово")
+        mode = "ТЕСТ" if dry else "Отправлено"
+        self._append(
+            self._log_email,
+            f"[{mode}] напоминания — ✓ {res['sent']}  "
+            f"✗ {res['failed']}  ⤬ без адреса {res['skipped']}")
+        for err in res["errors"][:50]:
+            self._append(self._log_email, f"  ✗ {err}")
+        messagebox.showinfo(
+            "Результат",
+            f"Отправлено: {res['sent']}\n"
+            f"Ошибок: {res['failed']}\n"
+            f"Без адреса: {res['skipped']}")
+
+    def _reminders_err(self, err):
+        self._btn_send_reminders.configure(state="normal")
+        self._status("Ошибка рассылки", ok=False)
+        self._append(self._log_email, f"✗ {err}")
+        messagebox.showerror("Ошибка", err)
 
     def _send_email(self):
         to = self._email_to.get().strip()
