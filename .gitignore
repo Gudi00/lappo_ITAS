@@ -48,3 +48,9 @@ Thumbs.db
 *.db-shm
 *.db-wal
 *.db-journal
+
+# AI-ассистенты (Gemini CLI, Claude Code и пр.) — не пушим артефакты/креды
+.gemini/
+.claude/
+.cursor/
+.aider*
